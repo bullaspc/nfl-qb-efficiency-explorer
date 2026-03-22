@@ -1,0 +1,987 @@
+import streamlit as st
+import nfl_data_py as nfl
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+
+# ── Palette constants (colorblind-safe) ───────────────────────────────────────
+# Diverging: cool blue (good) / warm red (bad), centered at 0
+_DIVERG = "RdBu"          # EPA diverging scale  (red = below avg, blue = above)
+_DIVERG_R = "RdBu_r"     # reversed for success rate (higher = more blue)
+_POS_CLR = "#4575B4"      # blue – above average / positive
+_NEG_CLR = "#D73027"      # red  – below average / negative
+_NEUTRAL = "#737373"      # mid-gray for reference lines and annotations
+
+st.set_page_config(
+    page_title="NFL QB Efficiency — EPA & Success Rate Explorer",
+    page_icon="🏈",
+    layout="wide",
+)
+
+# ── Minimal global style injection ────────────────────────────────────────────
+st.markdown(
+    """
+    <style>
+      /* Tighten metric card padding */
+      [data-testid="metric-container"] { padding: 0.4rem 0.6rem; }
+
+      /* ── Tab navigation ───────────────────────────────────────────────────── */
+      /* Breathing room between tab stops; still reads as one strip */
+      .stTabs [data-baseweb="tab-list"] {
+        gap: 6px;
+        border-bottom: 1px solid rgba(0,0,0,0.08);
+      }
+
+      /* Larger click target; no background fill (Tufte: no chartjunk) */
+      .stTabs [data-baseweb="tab"] {
+        padding: 0.5rem 0.85rem;
+        border-radius: 3px 3px 0 0;   /* soften top corners only */
+        color: #555555;
+        font-size: 0.875rem;
+        letter-spacing: 0.01em;
+        background: transparent;
+        border-bottom: 3px solid transparent;  /* reserve space; hidden when inactive */
+        transition: color 0.15s, border-color 0.15s;
+      }
+
+      /* Hover: legible highlight, no heavy fill */
+      .stTabs [data-baseweb="tab"]:hover {
+        color: #111111;
+        background: rgba(0,0,0,0.03);
+      }
+
+      /* Active tab: clear positional signal via a stronger underline stroke */
+      .stTabs [data-baseweb="tab"][aria-selected="true"] {
+        color: #1a56db;               /* Streamlit-consistent blue, not a new hue */
+        border-bottom: 3px solid #1a56db;
+        background: transparent;
+        font-weight: 600;             /* bold only on active; see note below */
+      }
+
+      /*
+        Note on font-weight: bold on the *active* label only is safe here because
+        all tab labels are short (1–3 words) and the strip height is fixed by the
+        padding — there is no layout shift from the weight change.
+      */
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("NFL QB Efficiency Explorer")
+st.caption(
+    "Passing efficiency (EPA/dropback) and accuracy (CPOE) from nflfastR · "
+    "Positive EPA = play generated value above expectation"
+)
+
+# ── Sidebar controls ──────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Data filters")
+
+    st.markdown("**Season & schedule**")
+    seasons = st.multiselect(
+        "Season(s)",
+        options=list(range(2016, 2026)),
+        default=[2025],
+    )
+    game_type = st.radio(
+        "Game type",
+        ["Regular season", "Postseason", "Both"],
+        index=0,
+        horizontal=True,
+    )
+    week_range = st.slider("Weeks", 1, 22, (1, 18), help="Regular season = weeks 1–18", disabled=game_type == "Postseason")
+
+    st.markdown("**Qualifying threshold**")
+    _postseason = game_type == "Postseason"
+    min_attempts = 5 if _postseason else st.slider(
+        "Min. pass attempts",
+        50, 500, 150, step=25,
+        help="QBs below this threshold are excluded from all views",
+    )
+    if _postseason:
+        st.caption("Min. attempts: 5 (postseason).")
+
+    st.markdown("**W-L record display**")
+    wl_type = st.radio(
+        "Show record for",
+        ["Regular Season", "Postseason"],
+        index=1 if _postseason else 0,
+        horizontal=True,
+        key="wl_type",
+    )
+
+if not seasons:
+    st.warning("Select at least one season in the sidebar.")
+    st.stop()
+
+# ── Load & cache data ─────────────────────────────────────────────────────────
+@st.cache_data(show_spinner="Loading play-by-play data…")
+def load_pbp(seasons: list[int]) -> pd.DataFrame:
+    wanted = [
+        "season", "week", "passer_player_name", "passer_player_id",
+        "pass_attempt", "epa", "cpoe", "air_yards", "yards_after_catch",
+        "complete_pass", "interception", "touchdown", "sack",
+        "qb_scramble", "posteam", "defteam", "season_type",
+        "was_pressure", "time_to_throw",
+    ]
+    # Load all columns (avoids nfl_data_py bug with columns= on missing fields),
+    # then narrow to only what we need. Optional cols are filled with NaN if absent.
+    pbp = nfl.import_pbp_data(seasons, downcast=True)
+    for col in wanted:
+        if col not in pbp.columns:
+            pbp[col] = float("nan")
+    return pbp[wanted]
+
+
+@st.cache_data(show_spinner="Loading roster headshots…")
+def load_rosters(seasons: list[int]) -> pd.DataFrame:
+    # nfl_data_py bug: import_weekly_rosters with multiple seasons produces a
+    # duplicate-index DataFrame and then does an in-place assignment that raises
+    # ValueError in pandas 2.x. Loading one season at a time sidesteps the issue.
+    frames = []
+    for yr in seasons:
+        try:
+            r = nfl.import_weekly_rosters([yr])
+            frames.append(
+                r[r["position"] == "QB"]
+                .dropna(subset=["headshot_url"])
+                [["player_id", "season", "headshot_url"]]
+            )
+        except Exception:
+            pass
+    if not frames:
+        return pd.DataFrame(columns=["player_id", "season", "headshot_url"])
+    return pd.concat(frames, ignore_index=True).drop_duplicates(["player_id", "season"])
+
+
+@st.cache_data(show_spinner=False)
+def load_teams() -> pd.DataFrame:
+    t = nfl.import_team_desc()[["team_abbr", "team_logo_espn", "team_color"]]
+    return t.dropna(subset=["team_logo_espn"])
+
+
+@st.cache_data(show_spinner="Computing QB game records…")
+def load_qb_records(seasons: list[int]) -> pd.DataFrame:
+    """W-L record per QB per season, based on games they started (most pass attempts)."""
+    # Identify starter per game: QB with highest pass-attempt count that game
+    pbp_cols = ["season", "week", "season_type", "posteam", "passer_player_name", "pass_attempt"]
+    pbp_r = nfl.import_pbp_data(seasons, columns=pbp_cols, downcast=True)
+    pbp_r = pbp_r[pbp_r["pass_attempt"] == 1].dropna(subset=["passer_player_name"])
+
+    starters = (
+        pbp_r.groupby(["season", "week", "season_type", "posteam", "passer_player_name"])["pass_attempt"]
+        .sum()
+        .reset_index(name="att")
+        .sort_values("att", ascending=False)
+        .drop_duplicates(["season", "week", "season_type", "posteam"])
+        [["season", "week", "season_type", "posteam", "passer_player_name"]]
+        .reset_index(drop=True)
+    )
+
+    # Schedule results
+    sched = nfl.import_schedules(seasons)[
+        ["season", "week", "game_type", "home_team", "away_team", "home_score", "away_score"]
+    ].dropna(subset=["home_score", "away_score"])
+    sched["season_type"] = sched["game_type"].apply(lambda x: "REG" if x == "REG" else "POST")
+
+    base_cols = ["season", "week", "season_type", "home_score", "away_score"]
+
+    home = starters.merge(
+        sched[base_cols + ["home_team"]].rename(columns={"home_team": "posteam"}),
+        on=["season", "week", "season_type", "posteam"], how="inner",
+    )
+    home["w"] = (home["home_score"] > home["away_score"]).astype(int)
+    home["l"] = (home["home_score"] < home["away_score"]).astype(int)
+    home["t"] = (home["home_score"] == home["away_score"]).astype(int)
+
+    away = starters.merge(
+        sched[base_cols + ["away_team"]].rename(columns={"away_team": "posteam"}),
+        on=["season", "week", "season_type", "posteam"], how="inner",
+    )
+    away["w"] = (away["away_score"] > away["home_score"]).astype(int)
+    away["l"] = (away["away_score"] < away["home_score"]).astype(int)
+    away["t"] = (away["away_score"] == away["home_score"]).astype(int)
+
+    keep = ["season", "passer_player_name", "season_type", "w", "l", "t"]
+    wl = (
+        pd.concat([home[keep], away[keep]], ignore_index=True)
+        .groupby(["season", "passer_player_name", "season_type"])[["w", "l", "t"]]
+        .sum()
+        .reset_index()
+    )
+    wl["record"] = wl.apply(
+        lambda r: f"{int(r.w)}-{int(r.l)}-{int(r.t)}" if r.t > 0 else f"{int(r.w)}-{int(r.l)}",
+        axis=1,
+    )
+    wl.rename(columns={"passer_player_name": "QB"}, inplace=True)
+    return wl[["season", "QB", "season_type", "record"]]
+
+
+raw = load_pbp(seasons)
+
+# ── Filter to dropback plays ───────────────────────────────────────────────────
+pbp = raw[
+    (raw["pass_attempt"] == 1) | (raw["qb_scramble"] == 1)
+].copy()
+if game_type == "Regular season":
+    pbp = pbp[pbp["season_type"] == "REG"]
+    pbp = pbp[pbp["week"].between(week_range[0], week_range[1])].copy()
+elif game_type == "Postseason":
+    pbp = pbp[pbp["season_type"] == "POST"].copy()
+else:
+    pbp = pbp[pbp["week"].between(week_range[0], week_range[1])].copy()
+pbp = pbp.dropna(subset=["passer_player_name", "epa"])
+
+# Success = EPA > 0
+pbp["success"] = (pbp["epa"] > 0).astype(float)
+
+# Pressure flag (was_pressure is boolean; coerce robustly)
+pbp["pressured"] = pbp["was_pressure"].astype(object) == True
+
+# ── Aggregate per QB ───────────────────────────────────────────────────────────
+agg = (
+    pbp.groupby(["season", "passer_player_name", "posteam"])
+    .agg(
+        attempts=("pass_attempt", "sum"),
+        player_id=("passer_player_id", "first"),
+        epa_total=("epa", "sum"),
+        epa_per_play=("epa", "mean"),
+        cpoe=("cpoe", "mean"),
+        completion_pct=("complete_pass", "mean"),
+        success_rate=("success", "mean"),
+        interceptions=("interception", "sum"),
+        touchdowns=("touchdown", "sum"),
+        sacks=("sack", "sum"),
+        air_yards=("air_yards", "mean"),
+        pressure_rate=("pressured", "mean"),
+        time_to_throw=("time_to_throw", "mean"),
+    )
+    .reset_index()
+)
+
+agg = agg[agg["attempts"] >= min_attempts].copy()
+agg = agg.round(2)
+agg.rename(columns={"passer_player_name": "QB", "posteam": "Team"}, inplace=True)
+
+# ── Split EPA: clean pocket vs under pressure ──────────────────────────────────
+_grp_keys = ["season", "passer_player_name", "posteam"]
+_epa_clean = (
+    pbp[~pbp["pressured"]].groupby(_grp_keys)["epa"].mean().rename("epa_clean")
+)
+_epa_press = (
+    pbp[pbp["pressured"]].groupby(_grp_keys)["epa"].mean().rename("epa_pressure")
+)
+_epa_split = (
+    pd.concat([_epa_clean, _epa_press], axis=1)
+    .reset_index()
+    .rename(columns={"passer_player_name": "QB", "posteam": "Team"})
+)
+_epa_split["pressure_drop"] = (_epa_split["epa_clean"] - _epa_split["epa_pressure"]).round(3)
+_epa_split[["epa_clean", "epa_pressure"]] = _epa_split[["epa_clean", "epa_pressure"]].round(3)
+agg = agg.merge(
+    _epa_split[["season", "QB", "Team", "epa_clean", "epa_pressure", "pressure_drop"]],
+    on=["season", "QB", "Team"], how="left",
+)
+
+# ── Enrich with headshots & team logos ────────────────────────────────────────
+rosters_df = load_rosters(seasons)
+teams_df = load_teams()
+
+agg = agg.merge(
+    rosters_df, on=["player_id", "season"], how="left"
+)
+agg = agg.merge(
+    teams_df.rename(columns={"team_abbr": "Team"}),
+    on="Team", how="left",
+)
+agg["headshot_url"] = agg["headshot_url"].fillna("")
+agg["team_logo_espn"] = agg["team_logo_espn"].fillna("")
+
+# ── Enrich with QB-specific W-L records (games started) ───────────────────────
+_qb_wl = load_qb_records(seasons)
+_reg = (
+    _qb_wl[_qb_wl["season_type"] == "REG"][["season", "QB", "record"]]
+    .rename(columns={"record": "reg_record"})
+    .drop_duplicates(["season", "QB"])
+    .reset_index(drop=True)
+)
+_post = (
+    _qb_wl[_qb_wl["season_type"] == "POST"][["season", "QB", "record"]]
+    .rename(columns={"record": "post_record"})
+    .drop_duplicates(["season", "QB"])
+    .reset_index(drop=True)
+)
+agg = agg.merge(_reg,  on=["season", "QB"], how="left")
+agg = agg.merge(_post, on=["season", "QB"], how="left")
+agg["reg_record"]  = agg["reg_record"].fillna("—")
+agg["post_record"] = agg["post_record"].fillna("—")
+
+agg = agg.reset_index(drop=True)
+
+if agg.empty:
+    st.warning("No QBs match the current filters. Try lowering the minimum attempts.")
+    st.stop()
+
+# ── Summary metrics ────────────────────────────────────────────────────────────
+st.subheader("League snapshot")
+c1, c2, c3, c4, c5 = st.columns(5)
+avg_epa_lg = agg["epa_per_play"].mean()
+
+c1.metric("Qualifying QBs", len(agg))
+
+if agg["epa_per_play"].notna().any():
+    top_epa = agg.loc[agg["epa_per_play"].idxmax()]
+    c2.metric("Best EPA/play", f"{top_epa['QB']}", delta=f"{top_epa['epa_per_play']:+.2f}")
+else:
+    c2.metric("Best EPA/play", "N/A")
+
+if agg["cpoe"].notna().any():
+    top_cpoe = agg.loc[agg["cpoe"].idxmax()]
+    c3.metric("Best CPOE", f"{top_cpoe['QB']}", delta=f"{top_cpoe['cpoe']:+.2f}%")
+else:
+    c3.metric("Best CPOE", "N/A")
+
+if agg["touchdowns"].notna().any():
+    most_tds = agg.loc[agg["touchdowns"].idxmax()]
+    c4.metric("Most TDs", f"{most_tds['QB']}", delta=f"{int(most_tds['touchdowns'])} TDs")
+else:
+    c4.metric("Most TDs", "N/A")
+
+if agg["success_rate"].notna().any():
+    top_sr = agg.loc[agg["success_rate"].idxmax()]
+    c5.metric("Best Success Rate", f"{top_sr['QB']}", delta=f"{top_sr['success_rate']:.1%}")
+else:
+    c5.metric("Best Success Rate", "N/A")
+
+# ── Shared layout defaults (Tufte-clean) ──────────────────────────────────────
+_LAYOUT = dict(
+    plot_bgcolor="rgba(0,0,0,0)",
+    paper_bgcolor="rgba(0,0,0,0)",
+    font=dict(family="Inter, Arial, sans-serif", size=14, color="#333333"),
+    hoverlabel=dict(bgcolor="#1a1a2e", bordercolor="#444466", font_size=14,
+                    font_color="white"),
+    margin=dict(l=10, r=90, t=70, b=40),
+    # Remove outer frame
+    xaxis=dict(showline=True, linecolor="#cccccc", mirror=False,
+               showgrid=False, zeroline=False),
+    yaxis=dict(showline=False, showgrid=True,
+               gridcolor="rgba(0,0,0,0.06)", zeroline=False),
+)
+
+
+def _clean_fig(fig: go.Figure, **overrides) -> go.Figure:
+    """Apply shared Tufte-clean layout to any Figure."""
+    layout = {**_LAYOUT, **overrides}
+    fig.update_layout(**layout)
+    return fig
+
+
+# ── Tab layout ─────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    [
+        "▦  EPA Rank",       # ranking bars — primary efficiency metric
+        "◎  EPA vs CPOE",   # bivariate scatter — efficiency × accuracy
+        "⟠  Trends",         # multi-QB longitudinal + weekly breakdown
+        "✓  Success Rate",   # secondary ranking — % positive-EPA dropbacks
+        "⊞  Data",           # raw table + CSV export
+    ]
+)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 1 – Horizontal bar: EPA per Dropback
+# ══════════════════════════════════════════════════════════════════════════════
+with tab1:
+    _all_seasons = sorted(agg["season"].unique(), reverse=True)
+    seasons_tab1 = st.multiselect(
+        "Season(s)", _all_seasons, default=[_all_seasons[0]], key="bar_season"
+    )
+    if not seasons_tab1:
+        st.info("Select at least one season.")
+        st.stop()
+
+    df_bar = agg[agg["season"].isin(seasons_tab1)].sort_values("epa_per_play", ascending=False).reset_index(drop=True)
+    df_bar['epa_per_play'] = df_bar['epa_per_play'].round(3)
+    _wl_col = "reg_record" if wl_type == "Regular Season" else "post_record"
+    _multi = len(seasons_tab1) > 1
+    df_bar["_label"] = (
+        df_bar["QB"] + "  ·  " + df_bar["Team"] + "  (" + df_bar[_wl_col] + ")"
+        + df_bar["season"].apply(lambda s: f"  {s}" if _multi else "")
+    )
+    df_show = df_bar.sort_values("epa_per_play").reset_index(drop=True)
+    lg_avg = df_bar["epa_per_play"].mean()
+
+    # Color: diverge around league average so "average" = white midpoint
+    fig_bar = go.Figure()
+    fig_bar.add_trace(go.Bar(
+        x=df_show["epa_per_play"],
+        y=df_show["_label"],
+        orientation="h",
+        marker=dict(
+            color=df_show["epa_per_play"],
+            colorscale=_DIVERG,
+            cmid=lg_avg,
+            showscale=True,
+            colorbar=dict(
+                title=dict(text="EPA/play", side="right"),
+                thickness=10, len=0.55, tickformat="+.2f",
+                outlinewidth=0,
+            ),
+        ),
+        customdata=list(zip(
+            df_show["success_rate"].map(lambda v: f"{v:.1%}"),
+            df_show["attempts"].map(lambda v: f"{int(v)}"),
+            df_show["touchdowns"].map(lambda v: f"{int(v)}"),
+            df_show["interceptions"].map(lambda v: f"{int(v)}"),
+            df_show["Team"],
+            df_show["epa_per_play"],
+            df_show["season"],
+            df_show["reg_record"] if wl_type == "Regular Season" else df_show["post_record"],
+        )),
+        hovertemplate=(
+            f"<span style='font-size:15px'><b>%{{y}}</b></span><br>"
+            f"Season: %{{customdata[6]}}<br>"
+            "EPA/play: %{customdata[5]:+.2f}<br>"
+            "Success Rate: %{customdata[0]}<br>"
+            "Attempts: %{customdata[1]}<br>"
+            "TDs: %{customdata[2]}  ·  INTs: %{customdata[3]}"
+            "<extra></extra>"
+        ),
+        name="",
+    ))
+
+    # Team logo images along the right edge
+    for _, row in df_show.iterrows():
+        if row["team_logo_espn"]:
+            fig_bar.add_layout_image(dict(
+                source=row["team_logo_espn"],
+                x=1.01, y=row["_label"],
+                xref="paper", yref="y",
+                sizex=0.04, sizey=0.04,
+                xanchor="left", yanchor="middle",
+                layer="above",
+            ))
+
+    # League-average reference line
+    fig_bar.add_vline(
+        x=lg_avg, line_dash="dot", line_color=_NEUTRAL, opacity=0.7,
+        annotation_text=f"Lg avg {lg_avg:+.2f}",
+        annotation_position="top right",
+        annotation_font_size=9,
+        annotation_font_color=_NEUTRAL,
+    )
+
+    _clean_fig(
+        fig_bar,
+        xaxis=dict(
+            title="EPA per dropback",
+            showline=True, linecolor="#cccccc", showgrid=False, zeroline=True,
+            zerolinecolor="#aaaaaa", zerolinewidth=1,
+        ),
+        yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=13)),
+        title=dict(
+            text=(
+                f"<b>EPA per Dropback — {', '.join(str(s) for s in sorted(seasons_tab1))}</b>"
+                f"<br><sup>Minimum {min_attempts} attempts · "
+                f"Blue = above league average · Red = below</sup>"
+            ),
+            font_size=18, x=0,
+        ),
+        height=max(500, len(df_show) * 46),
+        showlegend=False,
+    )
+    st.plotly_chart(fig_bar, width="stretch")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 2 – Scatter: EPA/play vs CPOE
+# ══════════════════════════════════════════════════════════════════════════════
+with tab2:
+    col_ctrl_a, col_ctrl_b = st.columns([1, 1])
+    with col_ctrl_a:
+        _all_seasons2 = sorted(agg["season"].unique(), reverse=True)
+        seasons_tab2 = st.multiselect(
+            "Season(s)", _all_seasons2, default=[_all_seasons2[0]], key="scatter_season"
+        )
+    with col_ctrl_b:
+        size_metric = st.selectbox(
+            "Bubble size",
+            ["attempts", "touchdowns", "air_yards", "pressure_rate", "time_to_throw"],
+            key="scatter_size",
+        )
+
+    if not seasons_tab2:
+        st.info("Select at least one season.")
+    else:
+        df_sc = agg[agg["season"].isin(seasons_tab2)].dropna(subset=["cpoe"])
+        if df_sc.empty:
+            st.info("No CPOE data available for the selected season / filters.")
+        else:
+            avg_epa_sc = df_sc["epa_per_play"].mean()
+            avg_cpoe_sc = df_sc["cpoe"].mean()
+            _sc_seasons_str = ", ".join(str(s) for s in sorted(seasons_tab2))
+
+            fig_sc = px.scatter(
+                df_sc,
+                x="cpoe",
+                y="epa_per_play",
+                text="QB",
+                size=size_metric,
+                color="success_rate",
+                color_continuous_scale=_DIVERG_R,
+                color_continuous_midpoint=df_sc["success_rate"].mean(),
+                custom_data=["Team",
+                             "attempts", "touchdowns", "interceptions",
+                             "completion_pct", "success_rate", "air_yards",
+                             "season",
+                             "reg_record" if wl_type == "Regular Season" else "post_record",
+                             "epa_clean", "epa_pressure", "pressure_drop",
+                             "pressure_rate", "time_to_throw"],
+                labels={
+                    "cpoe": "Completion % Over Expected (CPOE)",
+                    "epa_per_play": "EPA per Dropback",
+                    "success_rate": "Success Rate",
+                },
+                height=660,
+            )
+            fig_sc.update_traces(
+                textposition="top center",
+                texttemplate="%{text} · %{customdata[0]}<br><sup>%{customdata[7]}  %{customdata[8]}</sup>",
+                textfont=dict(size=11, color="#111111"),
+                marker=dict(opacity=0.55, line=dict(width=0.5, color="white")),
+                hovertemplate=(
+                    "<span style='font-size:16px'><b>%{text} · %{customdata[0]}</b></span><br>"
+                    f"Season: %{{customdata[7]}}  ·  {wl_type} Record: %{{customdata[8]}}<br>"
+                    "EPA/play: %{y:+.2f}  ·  CPOE: %{x:+.1f}%<br>"
+                    "Success Rate: %{customdata[5]:.1%}<br>"
+                    "Attempts: %{customdata[1]:.0f}  ·  TDs: %{customdata[2]:.0f}  ·  INTs: %{customdata[3]:.0f}<br>"
+                    "Comp%: %{customdata[4]:.1%}  ·  AvgAY: %{customdata[6]:.1f}<br>"
+                    "<b>── Pressure ──</b><br>"
+                    "Clean EPA: %{customdata[9]:+.2f}  ·  Pressure EPA: %{customdata[10]:+.2f}<br>"
+                    "Pressure Drop: %{customdata[11]:.2f}  ·  Pressure Rate: %{customdata[12]:.1%}<br>"
+                    "Time to Throw: %{customdata[13]:.2f}s"
+                    "<extra></extra>"
+                ),
+            )
+
+            # Headshot images at each QB's position on the scatter
+            x_range = df_sc["cpoe"].max() - df_sc["cpoe"].min()
+            y_range = df_sc["epa_per_play"].max() - df_sc["epa_per_play"].min()
+            img_w = x_range * 0.055
+            img_h = y_range * 0.13
+            for _, row in df_sc.iterrows():
+                if row["headshot_url"]:
+                    fig_sc.add_layout_image(dict(
+                        source=row["headshot_url"],
+                        x=row["cpoe"],
+                        y=row["epa_per_play"],
+                        xref="x", yref="y",
+                        sizex=img_w, sizey=img_h,
+                        xanchor="center", yanchor="middle",
+                        layer="above",
+                    ))
+
+            # Reference lines at league averages
+            fig_sc.add_hline(
+                y=avg_epa_sc, line_dash="dot", line_color=_NEUTRAL, opacity=0.6,
+                annotation_text=f"Avg EPA {avg_epa_sc:+.2f}",
+                annotation_position="bottom right",
+                annotation_font_size=9, annotation_font_color=_NEUTRAL,
+            )
+            fig_sc.add_vline(
+                x=avg_cpoe_sc, line_dash="dot", line_color=_NEUTRAL, opacity=0.6,
+                annotation_text=f"Avg CPOE {avg_cpoe_sc:+.1f}%",
+                annotation_position="top left",
+                annotation_font_size=9, annotation_font_color=_NEUTRAL,
+            )
+
+            x_lo, x_hi = df_sc["cpoe"].min(), df_sc["cpoe"].max()
+            y_lo, y_hi = df_sc["epa_per_play"].min(), df_sc["epa_per_play"].max()
+            qx_right = (avg_cpoe_sc + x_hi) / 2
+            qx_left  = (avg_cpoe_sc + x_lo) / 2
+            qy_top   = (avg_epa_sc  + y_hi) / 2
+            qy_bot   = (avg_epa_sc  + y_lo) / 2
+
+            for label, qx, qy in [
+                ("Accurate &amp; Efficient", qx_right, qy_top),
+                ("Accurate, Lower Value",    qx_left,  qy_top),
+                ("High EPA, Lower Accuracy", qx_right, qy_bot),
+                ("Below Average",            qx_left,  qy_bot),
+            ]:
+                fig_sc.add_annotation(
+                    x=qx, y=qy, text=label, showarrow=False,
+                    font=dict(size=8, color=_NEUTRAL), opacity=0.7,
+                    xanchor="center", yanchor="middle",
+                )
+
+            fig_sc.update_layout(
+                title=dict(
+                    text=f"<b>Accuracy vs Efficiency — {_sc_seasons_str}</b>"
+                         f"<br><sup>CPOE: completion % relative to model expectation · "
+                         f"Color = success rate · Size = {size_metric}</sup>",
+                    font_size=14, x=0,
+                ),
+                coloraxis_colorbar=dict(
+                    title=dict(text="Success Rate", side="right"),
+                    tickformat=".0%", thickness=10, len=0.55, outlinewidth=0,
+                ),
+            )
+            _clean_fig(
+                fig_sc,
+                xaxis=dict(
+                    title="Completion % Over Expected (CPOE)",
+                    showline=True, linecolor="#cccccc", showgrid=False,
+                    zeroline=True, zerolinecolor="#aaaaaa", zerolinewidth=1,
+                ),
+                yaxis=dict(
+                    title="EPA per Dropback", showline=False,
+                    showgrid=True, gridcolor="rgba(0,0,0,0.06)", zeroline=False,
+                ),
+            )
+            st.plotly_chart(fig_sc, width="stretch")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 3 – Season trends + weekly breakdown
+# ══════════════════════════════════════════════════════════════════════════════
+with tab3:
+    all_qbs = sorted(agg["QB"].unique())
+    default_qbs = agg.groupby("QB")["epa_per_play"].mean().nlargest(5).index.tolist()
+
+    col_t1, col_t2 = st.columns([2, 1])
+    with col_t1:
+        selected_qbs = st.multiselect(
+            "QBs to compare", all_qbs, default=default_qbs, key="trend_qbs"
+        )
+    with col_t2:
+        metric_opts = {
+            "EPA / Dropback": "epa_per_play",
+            "Success Rate": "success_rate",
+            "CPOE (%)": "cpoe",
+            "Completion %": "completion_pct",
+        }
+        metric_label = st.selectbox("Metric", list(metric_opts.keys()), key="trend_metric")
+    metric_col = metric_opts[metric_label]
+
+    if selected_qbs:
+        df_trend = agg[agg["QB"].isin(selected_qbs)]
+        is_pct = metric_col in ("success_rate", "completion_pct")
+
+        # Qualitative palette — 10 distinct, colorblind-tolerant colors (Tableau 10)
+        fig_trend = px.line(
+            df_trend,
+            x="season",
+            y=metric_col,
+            color="QB",
+            markers=True,
+            color_discrete_sequence=px.colors.qualitative.Safe,
+            hover_data={"attempts": True, "touchdowns": True, "success_rate": ":.1%"},
+            labels={metric_col: metric_label, "season": "Season"},
+            height=500,
+        )
+        fig_trend.update_traces(line=dict(width=2), marker=dict(size=7))
+        if is_pct:
+            fig_trend.update_layout(yaxis_tickformat=".0%")
+
+        if len(seasons) == 1:
+            season_range_str = str(seasons[0])
+            trend_title_suffix = f"Season {season_range_str}"
+        else:
+            season_range_str = f"{min(seasons)}–{max(seasons)}"
+            trend_title_suffix = f"Seasons {season_range_str}"
+        _clean_fig(
+            fig_trend,
+            title=dict(
+                text=f"<b>{metric_label} — Season Trend</b>"
+                     f"<br><sup>{trend_title_suffix} · "
+                     f"min {min_attempts} attempts per season</sup>",
+                font_size=14, x=0,
+            ),
+            xaxis=dict(
+                title="Season", dtick=1,
+                showline=True, linecolor="#cccccc", showgrid=False, zeroline=False,
+            ),
+            yaxis=dict(
+                title=metric_label, showline=False,
+                showgrid=True, gridcolor="rgba(0,0,0,0.06)", zeroline=False,
+            ),
+            legend=dict(
+                orientation="v", yanchor="top", y=1, xanchor="left", x=1.01,
+                title=dict(text=""), font=dict(size=13),
+            ),
+        )
+        st.plotly_chart(fig_trend, width="stretch")
+    else:
+        st.info("Select at least one QB above.")
+
+    st.markdown("---")
+    st.markdown("**Weekly breakdown for a single QB**")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        # Default to the first QB currently selected in the trend chart (if any)
+        _weekly_default_idx = (
+            all_qbs.index(selected_qbs[0])
+            if selected_qbs and selected_qbs[0] in all_qbs
+            else 0
+        )
+        qb_weekly = st.selectbox("QB", all_qbs, index=_weekly_default_idx, key="weekly_qb")
+    with col_b:
+        season_w = st.selectbox(
+            "Season", sorted(agg["season"].unique(), reverse=True), key="weekly_season"
+        )
+
+    weekly = (
+        pbp[
+            (pbp["passer_player_name"] == qb_weekly)
+            & (pbp["season"] == season_w)
+        ]
+        .groupby("week")
+        .agg(
+            epa_per_play=("epa", "mean"),
+            success_rate=("success", "mean"),
+            attempts=("pass_attempt", "sum"),
+        )
+        .reset_index()
+    )
+
+    if weekly.empty:
+        st.info("No data for this QB / season combination.")
+    else:
+        _qb_row = agg[(agg["QB"] == qb_weekly) & (agg["season"] == season_w)]
+        if not _qb_row.empty:
+            _r = _qb_row.iloc[0]
+            _rec = _r["reg_record"] if wl_type == "Regular Season" else _r["post_record"]
+            st.caption(
+                f"**{qb_weekly}** · {_r['Team']} · {season_w} · "
+                f"{wl_type} record: **{_rec}**"
+            )
+        fig_week = go.Figure()
+        fig_week.add_trace(go.Bar(
+            x=weekly["week"],
+            y=weekly["epa_per_play"],
+            name="EPA/play",
+            marker=dict(
+                color=weekly["epa_per_play"],
+                colorscale=_DIVERG,
+                cmid=0,
+                showscale=False,
+                opacity=0.85,
+            ),
+            customdata=weekly[["attempts", "success_rate"]].values,
+            hovertemplate=(
+                "<b>Week %{x}</b><br>"
+                "EPA/play: %{y:+.2f}<br>"
+                "Success Rate: %{customdata[1]:.1%}<br>"
+                "Attempts: %{customdata[0]}"
+                "<extra></extra>"
+            ),
+            # Show attempt count above/below each bar so small-sample weeks are obvious
+            text=weekly["attempts"],
+            textposition="outside",
+            textfont=dict(size=8, color="#888888"),
+        ))
+        fig_week.add_trace(go.Scatter(
+            x=weekly["week"],
+            y=weekly["success_rate"],
+            name="Success Rate",
+            mode="lines+markers",
+            line=dict(color=_POS_CLR, width=2),
+            marker=dict(size=6, symbol="circle"),
+            yaxis="y2",
+            hovertemplate="Week %{x}  ·  Success Rate: %{y:.1%}<extra></extra>",
+        ))
+
+        # Dynamic success-rate axis range: 10-pp padding beyond actual data,
+        # clamped to [0, 1] so clipping never occurs
+        sr_lo = max(0.0, weekly["success_rate"].min() - 0.10)
+        sr_hi = min(1.0, weekly["success_rate"].max() + 0.10)
+
+        # Flag any low-sample weeks (< 10 attempts) for the reader
+        low_sample_weeks = weekly[weekly["attempts"] < 10]
+        if not low_sample_weeks.empty:
+            st.caption(
+                f"Note: weeks {', '.join(str(w) for w in low_sample_weeks['week'])} "
+                f"have fewer than 10 attempts — treat those bars with caution."
+            )
+
+        _clean_fig(
+            fig_week,
+            title=dict(
+                text=f"<b>{qb_weekly} — Weekly Performance, {season_w}</b>"
+                     f"<br><sup>Bars = EPA/dropback · number above bar = attempts · "
+                     f"line = success rate (right axis)</sup>",
+                font_size=13, x=0,
+            ),
+            xaxis=dict(
+                title="Week", dtick=1,
+                showline=True, linecolor="#cccccc", showgrid=False,
+                zeroline=False,
+            ),
+            yaxis=dict(
+                title="EPA per Dropback",
+                showgrid=True, gridcolor="rgba(0,0,0,0.06)", zeroline=True,
+                zerolinecolor="#aaaaaa", zerolinewidth=1,
+            ),
+            yaxis2=dict(
+                title="Success Rate", overlaying="y", side="right",
+                tickformat=".0%", range=[sr_lo, sr_hi], showgrid=False,
+                zeroline=False, showline=False,
+            ),
+            legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="right", x=1),
+            height=420,
+        )
+        st.plotly_chart(fig_week, width="stretch")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 4 – Success Rate ranking (moved from Tab 2 to reduce up-front noise)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab4:
+    _all_seasons4 = sorted(agg["season"].unique(), reverse=True)
+    seasons_tab4 = st.multiselect(
+        "Season(s)", _all_seasons4, default=[_all_seasons4[0]], key="sr_season"
+    )
+    if not seasons_tab4:
+        st.info("Select at least one season.")
+        st.stop()
+
+    df_sr = agg[agg["season"].isin(seasons_tab4)].sort_values("success_rate", ascending=False).reset_index(drop=True)
+    _wl_col_sr = "reg_record" if wl_type == "Regular Season" else "post_record"
+    _multi4 = len(seasons_tab4) > 1
+    df_sr["_label"] = (
+        df_sr["QB"] + "  ·  " + df_sr["Team"] + "  (" + df_sr[_wl_col_sr] + ")"
+        + df_sr["season"].apply(lambda s: f"  {s}" if _multi4 else "")
+    )
+    df_sr_show = df_sr.sort_values("success_rate").reset_index(drop=True)
+    league_avg_sr = df_sr["success_rate"].mean()
+
+    fig_sr = go.Figure()
+    fig_sr.add_trace(go.Bar(
+        x=df_sr_show["success_rate"],
+        y=df_sr_show["_label"],
+        orientation="h",
+        marker=dict(
+            color=df_sr_show["success_rate"],
+            colorscale=_DIVERG_R,
+            cmid=league_avg_sr,
+            showscale=True,
+            colorbar=dict(
+                title=dict(text="Success Rate", side="right"),
+                thickness=10, len=0.55, tickformat=".0%", outlinewidth=0,
+            ),
+        ),
+        customdata=list(zip(
+            df_sr_show["epa_per_play"],
+            df_sr_show["attempts"].map(lambda v: f"{int(v)}"),
+            df_sr_show["touchdowns"].map(lambda v: f"{int(v)}"),
+            df_sr_show["interceptions"].map(lambda v: f"{int(v)}"),
+            df_sr_show["Team"],
+            df_sr_show["success_rate"].map(lambda v: f"{v:.1%}"),
+            df_sr_show["season"],
+            df_sr_show["reg_record"] if wl_type == "Regular Season" else df_sr_show["post_record"],
+        )),
+        hovertemplate=(
+            "<span style='font-size:15px'><b>%{y}</b></span><br>"
+            f"Season: %{{customdata[6]}}<br>"
+            "Success Rate: %{customdata[5]}<br>"
+            "EPA/play: %{customdata[0]:+.2f}<br>"
+            "Attempts: %{customdata[1]}<br>"
+            "TDs: %{customdata[2]}  ·  INTs: %{customdata[3]}"
+            "<extra></extra>"
+        ),
+        name="",
+    ))
+
+    # Team logo images along the right edge
+    for _, row in df_sr_show.iterrows():
+        if row["team_logo_espn"]:
+            fig_sr.add_layout_image(dict(
+                source=row["team_logo_espn"],
+                x=1.01, y=row["_label"],
+                xref="paper", yref="y",
+                sizex=0.04, sizey=0.04,
+                xanchor="left", yanchor="middle",
+                layer="above",
+            ))
+
+    fig_sr.add_vline(
+        x=league_avg_sr, line_dash="dot", line_color=_NEUTRAL, opacity=0.7,
+        annotation_text=f"Lg avg {league_avg_sr:.1%}",
+        annotation_position="top right",
+        annotation_font_size=9, annotation_font_color=_NEUTRAL,
+    )
+
+    _clean_fig(
+        fig_sr,
+        title=dict(
+            text=(
+                f"<b>Success Rate — {', '.join(str(s) for s in sorted(seasons_tab4))}</b>"
+                f"<br><sup>% of dropbacks generating positive EPA · "
+                f"minimum {min_attempts} attempts</sup>"
+            ),
+            font_size=14, x=0,
+        ),
+        xaxis=dict(
+            title="Success Rate (% positive-EPA dropbacks)",
+            tickformat=".0%",
+            showline=True, linecolor="#cccccc", showgrid=False, zeroline=False,
+        ),
+        yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=13)),
+        height=max(500, len(df_sr_show) * 46),
+        showlegend=False,
+    )
+    st.plotly_chart(fig_sr, width="stretch")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 5 – Raw data table
+# ══════════════════════════════════════════════════════════════════════════════
+with tab5:
+    _all_seasons5 = sorted(agg["season"].unique(), reverse=True)
+    seasons_tab5 = st.multiselect(
+        "Season(s)", _all_seasons5, default=_all_seasons5, key="data_season"
+    )
+    agg_tab5 = agg[agg["season"].isin(seasons_tab5)] if seasons_tab5 else agg
+    st.markdown("**Aggregated QB stats** — sorted by season then EPA/play")
+
+    cols_display = [
+        "headshot_url", "team_logo_espn",
+        "season", "QB", "Team", "attempts",
+        "epa_per_play", "epa_total", "success_rate",
+        "cpoe", "completion_pct", "touchdowns", "interceptions", "sacks", "air_yards",
+        "epa_clean", "epa_pressure", "pressure_drop", "pressure_rate", "time_to_throw",
+    ]
+
+    styled = (
+        agg_tab5[cols_display]
+        .sort_values(["season", "epa_per_play"], ascending=[False, False])
+        .style
+        .format({
+            "epa_per_play":   "{:+.2f}",
+            "epa_total":      "{:+.1f}",
+            "success_rate":   "{:.1%}",
+            "completion_pct": "{:.1%}",
+            "cpoe":           "{:+.2f}",
+            "air_yards":      "{:.1f}",
+            "epa_clean":      "{:+.3f}",
+            "epa_pressure":   "{:+.3f}",
+            "pressure_drop":  "{:.3f}",
+            "pressure_rate":  "{:.1%}",
+            "time_to_throw":  "{:.2f}s",
+        }, na_rep="—")
+        .background_gradient(subset=["epa_per_play"], cmap="RdBu", vmin=-0.3, vmax=0.3)
+        .background_gradient(subset=["success_rate"], cmap="RdBu", vmin=0.35, vmax=0.65)
+        .background_gradient(subset=["pressure_drop"], cmap="RdBu_r", vmin=0.2, vmax=1.2)
+    )
+
+    st.dataframe(
+        styled,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "headshot_url":   st.column_config.ImageColumn("Photo", width="small"),
+            "team_logo_espn": st.column_config.ImageColumn("Logo",  width="small"),
+        },
+    )
+    csv = agg_tab5[cols_display].to_csv(index=False)
+    st.download_button("Download CSV", csv, "qb_epa.csv", "text/csv")
