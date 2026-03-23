@@ -25,8 +25,10 @@ This is a single-file Streamlit app ([qb_epa_app.py](qb_epa_app.py)) that visual
 1. `load_pbp()` — fetches play-by-play data for selected seasons (cached)
 2. `load_rosters()` — fetches QB headshots (cached)
 3. `load_teams()` — fetches team logos and colors (cached)
-4. Filtering: dropback plays only (`pass_attempt==1` or `qb_scramble==1`), within selected week range, with a minimum attempts threshold
-5. Aggregation per QB/season/team → `agg` DataFrame used across all tabs
+4. `load_qb_records()` — computes per-QB W-L records from schedules (cached)
+5. Filtering: dropback plays only (`pass_attempt==1` or `qb_scramble==1`), within selected week/game-type range, with a minimum attempts threshold
+6. Pressure splits computed: `epa_clean`, `epa_pressure`, `pressure_drop` per QB
+7. Aggregation per QB/season/team → `agg` DataFrame used across all tabs
 
 **Five tabs:**
 - **EPA Rankings** — horizontal bar chart, EPA/dropback, diverging color around league average
@@ -37,4 +39,4 @@ This is a single-file Streamlit app ([qb_epa_app.py](qb_epa_app.py)) that visual
 
 **Chart styling:** `_LAYOUT` dict and `_clean_fig()` apply a shared Tufte-minimal theme (no chart junk, transparent background, RdBu diverging palette) to all `go.Figure` objects. Plotly Express figures call `_clean_fig()` after construction.
 
-**Sidebar controls** (`seasons`, `week_range`, `min_attempts`) apply globally to all tabs via the `agg` DataFrame filter.
+**Sidebar controls** (`seasons`, `game_type`, `week_range`, `min_attempts`, `wl_type`) apply globally to all tabs via the `agg` DataFrame filter.
