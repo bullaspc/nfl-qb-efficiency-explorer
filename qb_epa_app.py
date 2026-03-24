@@ -123,7 +123,7 @@ def load_pbp(seasons: list[int]) -> pd.DataFrame:
         "pass_attempt", "epa", "cpoe", "air_yards", "yards_after_catch",
         "complete_pass", "interception", "touchdown", "sack",
         "qb_scramble", "posteam", "defteam", "season_type",
-        "was_pressure", "time_to_throw",
+        "was_pressure", "time_to_throw", "play_type",
     ]
     # Load all columns (avoids nfl_data_py bug with columns= on missing fields),
     # then narrow to only what we need. Optional cols are filled with NaN if absent.
@@ -220,6 +220,15 @@ def load_qb_records(seasons: list[int]) -> pd.DataFrame:
 
 raw = load_pbp(seasons)
 
+# ── Total offensive snap count per team/season (used for dropback_pct) ─────────
+_scrimmage_types = {"pass", "run", "qb_kneel", "qb_spike"}
+_total_snaps = (
+    raw[raw["play_type"].isin(_scrimmage_types)]
+    .groupby(["season", "posteam"])
+    .size()
+    .reset_index(name="total_snaps")
+)
+
 # ── Filter to dropback plays ───────────────────────────────────────────────────
 pbp = raw[
     (raw["pass_attempt"] == 1) | (raw["qb_scramble"] == 1)
@@ -283,6 +292,12 @@ agg = agg.merge(
     _epa_split[["season", "QB", "Team", "epa_clean", "epa_pressure", "pressure_drop"]],
     on=["season", "QB", "Team"], how="left",
 )
+
+# ── Dropback snap share ────────────────────────────────────────────────────────
+agg = agg.merge(
+    _total_snaps, left_on=["season", "Team"], right_on=["season", "posteam"], how="left"
+).drop(columns=["posteam"])
+agg["dropback_pct"] = (agg["attempts"] / agg["total_snaps"] * 100).round(1)
 
 # ── Enrich with headshots & team logos ────────────────────────────────────────
 rosters_df = load_rosters(seasons)
@@ -378,13 +393,14 @@ def _clean_fig(fig: go.Figure, **overrides) -> go.Figure:
 
 
 # ── Tab layout ─────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     [
         "▦  EPA Rank",       # ranking bars — primary efficiency metric
         "◎  EPA vs CPOE",   # bivariate scatter — efficiency × accuracy
         "⟠  Trends",         # multi-QB longitudinal + weekly breakdown
         "✓  Success Rate",   # secondary ranking — % positive-EPA dropbacks
         "⊞  Data",           # raw table + CSV export
+        "⧖  Snap %",         # dropback snap share vs total offensive plays
     ]
 )
 
@@ -985,3 +1001,104 @@ with tab5:
     )
     csv = agg_tab5[cols_display].to_csv(index=False)
     st.download_button("Download CSV", csv, "qb_epa.csv", "text/csv")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 6 – Dropback Snap Share
+# ══════════════════════════════════════════════════════════════════════════════
+with tab6:
+    _all_seasons6 = sorted(agg["season"].unique(), reverse=True)
+    seasons_tab6 = st.multiselect(
+        "Season(s)", _all_seasons6, default=[_all_seasons6[0]], key="snap_season"
+    )
+    if not seasons_tab6:
+        st.info("Select at least one season.")
+        st.stop()
+
+    df_snap = (
+        agg[agg["season"].isin(seasons_tab6)]
+        .dropna(subset=["dropback_pct"])
+        .sort_values("dropback_pct", ascending=False)
+        .reset_index(drop=True)
+    )
+    _wl_col_snap = "reg_record" if wl_type == "Regular Season" else "post_record"
+    _multi6 = len(seasons_tab6) > 1
+    df_snap["_label"] = (
+        df_snap["QB"] + "  ·  " + df_snap["Team"] + "  (" + df_snap[_wl_col_snap] + ")"
+        + df_snap["season"].apply(lambda s: f"  {s}" if _multi6 else "")
+    )
+    df_snap_show = df_snap.sort_values("dropback_pct").reset_index(drop=True)
+    league_avg_snap = df_snap["dropback_pct"].mean()
+
+    fig_snap = go.Figure()
+    fig_snap.add_trace(go.Bar(
+        x=df_snap_show["dropback_pct"],
+        y=df_snap_show["_label"],
+        orientation="h",
+        marker=dict(
+            color=df_snap_show["dropback_pct"],
+            colorscale=_DIVERG_R,
+            cmid=league_avg_snap,
+            showscale=True,
+            colorbar=dict(
+                title=dict(text="Snap %", side="right"),
+                thickness=10, len=0.55, ticksuffix="%", outlinewidth=0,
+            ),
+        ),
+        customdata=list(zip(
+            df_snap_show["dropback_pct"],
+            df_snap_show["attempts"].map(lambda v: f"{int(v)}"),
+            df_snap_show["total_snaps"].map(lambda v: f"{int(v)}"),
+            df_snap_show["epa_per_play"],
+            df_snap_show["season"],
+        )),
+        hovertemplate=(
+            "<span style='font-size:15px'><b>%{y}</b></span><br>"
+            "Dropback %: %{customdata[0]:.1f}%<br>"
+            "Dropback attempts: %{customdata[1]}<br>"
+            "Tot. snap offensivi: %{customdata[2]}<br>"
+            "EPA/play: %{customdata[3]:+.2f}<br>"
+            "Season: %{customdata[4]}"
+            "<extra></extra>"
+        ),
+        name="",
+    ))
+
+    # Team logo images along the right edge
+    for _, row in df_snap_show.iterrows():
+        if row["team_logo_espn"]:
+            fig_snap.add_layout_image(dict(
+                source=row["team_logo_espn"],
+                x=1.01, y=row["_label"],
+                xref="paper", yref="y",
+                sizex=0.04, sizey=0.04,
+                xanchor="left", yanchor="middle",
+                layer="above",
+            ))
+
+    fig_snap.add_vline(
+        x=league_avg_snap, line_dash="dot", line_color=_NEUTRAL, opacity=0.7,
+        annotation_text=f"Lg avg {league_avg_snap:.1f}%",
+        annotation_position="top right",
+        annotation_font_size=9, annotation_font_color=_NEUTRAL,
+    )
+
+    _clean_fig(
+        fig_snap,
+        title=dict(
+            text=(
+                f"<b>Dropback Snap Share — {', '.join(str(s) for s in sorted(seasons_tab6))}</b>"
+                f"<br><sup>% di snap in dropback del QB sul totale degli snap offensivi della squadra · "
+                f"minimo {min_attempts} tentativi</sup>"
+            ),
+            font_size=14, x=0,
+        ),
+        xaxis=dict(
+            title="Dropback snap share (%)",
+            ticksuffix="%",
+            showline=True, linecolor="#cccccc", showgrid=False, zeroline=False,
+        ),
+        yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=13)),
+        height=max(500, len(df_snap_show) * 46),
+        showlegend=False,
+    )
+    st.plotly_chart(fig_snap, width="stretch")
