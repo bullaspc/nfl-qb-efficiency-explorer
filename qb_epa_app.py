@@ -1,8 +1,11 @@
 import streamlit as st
 import nfl_data_py as nfl
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from pathlib import Path
+from datetime import datetime, timedelta
 
 # ── Palette constants (colorblind-safe) ───────────────────────────────────────
 # Diverging: cool blue (good) / warm red (bad), centered at 0
@@ -111,27 +114,61 @@ with st.sidebar:
         key="wl_type",
     )
 
+    st.markdown("**Play filters**")
+    quarters = st.multiselect(
+        "Quarters", [1, 2, 3, 4], default=[1, 2, 3, 4],
+        format_func=lambda q: f"Q{q}",
+    )
+    wp_range = st.slider(
+        "Win probability range", 0.0, 1.0, (0.0, 1.0), step=0.05,
+        help="Exclude plays where win probability falls outside this range",
+    )
+    excl_garbage = st.checkbox(
+        "Exclude garbage time", value=False,
+        help="Drops plays with score diff >28 or >17 pts in Q4",
+    )
+
 if not seasons:
     st.warning("Select at least one season in the sidebar.")
     st.stop()
 
+# ── Disk-based PBP cache ───────────────────────────────────────────────────────
+_DATA_DIR = Path(__file__).parent / "data"
+_CURRENT_YEAR = 2025
+_PBP_COLS = [
+    "season", "week", "passer_player_name", "passer_player_id",
+    "pass_attempt", "epa", "cpoe", "air_yards", "yards_after_catch",
+    "complete_pass", "interception", "touchdown", "sack",
+    "qb_scramble", "posteam", "defteam", "season_type",
+    "was_pressure", "time_to_throw",
+    "score_differential", "qtr", "wp",
+]
+
+
+def _get_pbp(season: int) -> pd.DataFrame:
+    """Return PBP for one season from disk cache; download & save if missing, stale, or schema changed."""
+    path = _DATA_DIR / f"pbp_{season}.parquet"
+    if path.exists():
+        stale = season >= _CURRENT_YEAR and (
+            datetime.now() - datetime.fromtimestamp(path.stat().st_mtime) >= timedelta(hours=24)
+        )
+        if not stale:
+            cached = pd.read_parquet(path)
+            if all(c in cached.columns for c in _PBP_COLS):
+                return cached
+    pbp = nfl.import_pbp_data([season], downcast=True)
+    for col in _PBP_COLS:
+        if col not in pbp.columns:
+            pbp[col] = float("nan")
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    pbp[_PBP_COLS].to_parquet(path, index=False)
+    return pbp[_PBP_COLS]
+
+
 # ── Load & cache data ─────────────────────────────────────────────────────────
 @st.cache_data(show_spinner="Loading play-by-play data…")
 def load_pbp(seasons: list[int]) -> pd.DataFrame:
-    wanted = [
-        "season", "week", "passer_player_name", "passer_player_id",
-        "pass_attempt", "epa", "cpoe", "air_yards", "yards_after_catch",
-        "complete_pass", "interception", "touchdown", "sack",
-        "qb_scramble", "posteam", "defteam", "season_type",
-        "was_pressure", "time_to_throw",
-    ]
-    # Load all columns (avoids nfl_data_py bug with columns= on missing fields),
-    # then narrow to only what we need. Optional cols are filled with NaN if absent.
-    pbp = nfl.import_pbp_data(seasons, downcast=True)
-    for col in wanted:
-        if col not in pbp.columns:
-            pbp[col] = float("nan")
-    return pbp[wanted]
+    return pd.concat([_get_pbp(yr) for yr in seasons], ignore_index=True)
 
 
 @st.cache_data(show_spinner="Loading roster headshots…")
@@ -164,9 +201,8 @@ def load_teams() -> pd.DataFrame:
 @st.cache_data(show_spinner="Computing QB game records…")
 def load_qb_records(seasons: list[int]) -> pd.DataFrame:
     """W-L record per QB per season, based on games they started (most pass attempts)."""
-    # Identify starter per game: QB with highest pass-attempt count that game
-    pbp_cols = ["season", "week", "season_type", "posteam", "passer_player_name", "pass_attempt"]
-    pbp_r = nfl.import_pbp_data(seasons, columns=pbp_cols, downcast=True)
+    _cols = ["season", "week", "season_type", "posteam", "passer_player_name", "pass_attempt"]
+    pbp_r = pd.concat([_get_pbp(yr)[_cols] for yr in seasons], ignore_index=True)
     pbp_r = pbp_r[pbp_r["pass_attempt"] == 1].dropna(subset=["passer_player_name"])
 
     starters = (
@@ -218,6 +254,32 @@ def load_qb_records(seasons: list[int]) -> pd.DataFrame:
     return wl[["season", "QB", "season_type", "record"]]
 
 
+@st.cache_data(show_spinner=False)
+def load_epa_reference() -> np.ndarray:
+    """EPA/play per QB-season from 2016+ (REG, min 150 attempts) — historical percentile pool."""
+    ref_cols = ["season", "passer_player_name", "pass_attempt", "epa", "qb_scramble", "season_type"]
+    pbp_ref = pd.concat(
+        [_get_pbp(yr)[ref_cols] for yr in range(2016, 2026)],
+        ignore_index=True,
+    )
+    pbp_ref = pbp_ref[
+        ((pbp_ref["pass_attempt"] == 1) | (pbp_ref["qb_scramble"] == 1)) &
+        (pbp_ref["season_type"] == "REG")
+    ].dropna(subset=["passer_player_name", "epa"])
+    ref_agg = (
+        pbp_ref.groupby(["season", "passer_player_name"])
+        .agg(att=("pass_attempt", "sum"), epa_per_play=("epa", "mean"))
+        .reset_index()
+    )
+    return ref_agg[ref_agg["att"] >= 150]["epa_per_play"].values
+
+
+def _ordinal(n: float) -> str:
+    n = int(round(n))
+    sfx = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{sfx}"
+
+
 raw = load_pbp(seasons)
 
 # ── Filter to dropback plays ───────────────────────────────────────────────────
@@ -232,6 +294,18 @@ elif game_type == "Postseason":
 else:
     pbp = pbp[pbp["week"].between(week_range[0], week_range[1])].copy()
 pbp = pbp.dropna(subset=["passer_player_name", "epa"])
+
+# ── Play-level filters (quarter / win probability / garbage time) ──────────────
+if quarters and set(quarters) != {1, 2, 3, 4}:
+    pbp = pbp[pbp["qtr"].isin(quarters)]
+if wp_range != (0.0, 1.0):
+    pbp = pbp[pbp["wp"].between(wp_range[0], wp_range[1])]
+if excl_garbage:
+    garbage = (
+        (pbp["score_differential"].abs() > 28) |
+        ((pbp["score_differential"].abs() > 17) & (pbp["qtr"] == 4))
+    )
+    pbp = pbp[~garbage]
 
 # Success = EPA > 0
 pbp["success"] = (pbp["epa"] > 0).astype(float)
@@ -316,6 +390,13 @@ agg = agg.merge(_reg,  on=["season", "QB"], how="left")
 agg = agg.merge(_post, on=["season", "QB"], how="left")
 agg["reg_record"]  = agg["reg_record"].fillna("—")
 agg["post_record"] = agg["post_record"].fillna("—")
+
+# ── Historical EPA percentile (vs all QB-seasons 2016+, REG, min 150 att) ─────
+_ref_epa = load_epa_reference()
+agg["epa_pct"] = agg["epa_per_play"].apply(
+    lambda v: _ordinal(((_ref_epa < v).sum() / len(_ref_epa)) * 100) + " pct"
+    if pd.notna(v) and len(_ref_epa) > 0 else "—"
+)
 
 agg = agg.reset_index(drop=True)
 
@@ -434,14 +515,15 @@ with tab1:
             df_show["touchdowns"].map(lambda v: f"{int(v)}"),
             df_show["interceptions"].map(lambda v: f"{int(v)}"),
             df_show["Team"],
-            df_show["epa_per_play"],
+            df_show["epa_per_play"].map(lambda v: f"{v:+.2f}"),
             df_show["season"],
             df_show["reg_record"] if wl_type == "Regular Season" else df_show["post_record"],
+            df_show["epa_pct"],
         )),
         hovertemplate=(
             f"<span style='font-size:15px'><b>%{{y}}</b></span><br>"
             f"Season: %{{customdata[6]}}<br>"
-            "EPA/play: %{customdata[5]:+.2f}<br>"
+            "EPA/play: %{customdata[5]}  ·  %{customdata[8]} (since 2016)<br>"
             "Success Rate: %{customdata[0]}<br>"
             "Attempts: %{customdata[1]}<br>"
             "TDs: %{customdata[2]}  ·  INTs: %{customdata[3]}"
@@ -513,10 +595,17 @@ with tab2:
     if not seasons_tab2:
         st.info("Select at least one season.")
     else:
-        df_sc = agg[agg["season"].isin(seasons_tab2)].dropna(subset=["cpoe"])
+        df_sc = agg[agg["season"].isin(seasons_tab2)].dropna(subset=["cpoe"]).copy()
         if df_sc.empty:
             st.info("No CPOE data available for the selected season / filters.")
         else:
+            # Pre-format EPA columns — Plotly d3 specifiers don't work on customdata
+            _fmt = lambda v, spec: format(v, spec) if pd.notna(v) else "—"
+            df_sc["_epa_fmt"]      = df_sc["epa_per_play"].map(lambda v: _fmt(v, "+.2f"))
+            df_sc["_epa_clean_fmt"]  = df_sc["epa_clean"].map(lambda v: _fmt(v, "+.2f"))
+            df_sc["_epa_press_fmt"]  = df_sc["epa_pressure"].map(lambda v: _fmt(v, "+.2f"))
+            df_sc["_pdrop_fmt"]      = df_sc["pressure_drop"].map(lambda v: _fmt(v, ".2f"))
+
             avg_epa_sc = df_sc["epa_per_play"].mean()
             avg_cpoe_sc = df_sc["cpoe"].mean()
             _sc_seasons_str = ", ".join(str(s) for s in sorted(seasons_tab2))
@@ -535,8 +624,8 @@ with tab2:
                              "completion_pct", "success_rate", "air_yards",
                              "season",
                              "reg_record" if wl_type == "Regular Season" else "post_record",
-                             "epa_clean", "epa_pressure", "pressure_drop",
-                             "pressure_rate", "time_to_throw"],
+                             "_epa_clean_fmt", "_epa_press_fmt", "_pdrop_fmt",
+                             "pressure_rate", "time_to_throw", "_epa_fmt"],
                 labels={
                     "cpoe": "Completion % Over Expected (CPOE)",
                     "epa_per_play": "EPA per Dropback",
@@ -552,13 +641,13 @@ with tab2:
                 hovertemplate=(
                     "<span style='font-size:16px'><b>%{text} · %{customdata[0]}</b></span><br>"
                     f"Season: %{{customdata[7]}}  ·  {wl_type} Record: %{{customdata[8]}}<br>"
-                    "EPA/play: %{y:+.2f}  ·  CPOE: %{x:+.1f}%<br>"
+                    "EPA/play: %{customdata[14]}  ·  CPOE: %{x:+.1f}%<br>"
                     "Success Rate: %{customdata[5]:.1%}<br>"
                     "Attempts: %{customdata[1]:.0f}  ·  TDs: %{customdata[2]:.0f}  ·  INTs: %{customdata[3]:.0f}<br>"
                     "Comp%: %{customdata[4]:.1%}  ·  AvgAY: %{customdata[6]:.1f}<br>"
                     "<b>── Pressure ──</b><br>"
-                    "Clean EPA: %{customdata[9]:+.2f}  ·  Pressure EPA: %{customdata[10]:+.2f}<br>"
-                    "Pressure Drop: %{customdata[11]:.2f}  ·  Pressure Rate: %{customdata[12]:.1%}<br>"
+                    "Clean EPA: %{customdata[9]}  ·  Pressure EPA: %{customdata[10]}<br>"
+                    "Pressure Drop: %{customdata[11]}  ·  Pressure Rate: %{customdata[12]:.1%}<br>"
                     "Time to Throw: %{customdata[13]:.2f}s"
                     "<extra></extra>"
                 ),
@@ -567,8 +656,8 @@ with tab2:
             # Headshot images at each QB's position on the scatter
             x_range = df_sc["cpoe"].max() - df_sc["cpoe"].min()
             y_range = df_sc["epa_per_play"].max() - df_sc["epa_per_play"].min()
-            img_w = x_range * 0.055
-            img_h = y_range * 0.13
+            img_w = (x_range or 1.0) * 0.055
+            img_h = (y_range or 0.1) * 0.13
             for _, row in df_sc.iterrows():
                 if row["headshot_url"]:
                     fig_sc.add_layout_image(dict(
@@ -586,13 +675,13 @@ with tab2:
                 y=avg_epa_sc, line_dash="dot", line_color=_NEUTRAL, opacity=0.6,
                 annotation_text=f"Avg EPA {avg_epa_sc:+.2f}",
                 annotation_position="bottom right",
-                annotation_font_size=9, annotation_font_color=_NEUTRAL,
+                annotation_font_size=14, annotation_font_color=_NEUTRAL,
             )
             fig_sc.add_vline(
                 x=avg_cpoe_sc, line_dash="dot", line_color=_NEUTRAL, opacity=0.6,
                 annotation_text=f"Avg CPOE {avg_cpoe_sc:+.1f}%",
                 annotation_position="top left",
-                annotation_font_size=9, annotation_font_color=_NEUTRAL,
+                annotation_font_size=14, annotation_font_color=_NEUTRAL,
             )
 
             x_lo, x_hi = df_sc["cpoe"].min(), df_sc["cpoe"].max()
@@ -610,7 +699,7 @@ with tab2:
             ]:
                 fig_sc.add_annotation(
                     x=qx, y=qy, text=label, showarrow=False,
-                    font=dict(size=8, color=_NEUTRAL), opacity=0.7,
+                    font=dict(size=14, color=_NEUTRAL), opacity=0.5,
                     xanchor="center", yanchor="middle",
                 )
 
@@ -619,7 +708,7 @@ with tab2:
                     text=f"<b>Accuracy vs Efficiency — {_sc_seasons_str}</b>"
                          f"<br><sup>CPOE: completion % relative to model expectation · "
                          f"Color = success rate · Size = {size_metric}</sup>",
-                    font_size=14, x=0,
+                    font_size=18, x=0,
                 ),
                 coloraxis_colorbar=dict(
                     title=dict(text="Success Rate", side="right"),
@@ -740,6 +829,7 @@ with tab3:
             epa_per_play=("epa", "mean"),
             success_rate=("success", "mean"),
             attempts=("pass_attempt", "sum"),
+            opponent=("defteam", "first"),
         )
         .reset_index()
     )
@@ -767,9 +857,9 @@ with tab3:
                 showscale=False,
                 opacity=0.85,
             ),
-            customdata=weekly[["attempts", "success_rate"]].values,
+            customdata=weekly[["attempts", "success_rate", "opponent"]].values,
             hovertemplate=(
-                "<b>Week %{x}</b><br>"
+                "<b>Week %{x}  vs  %{customdata[2]}</b><br>"
                 "EPA/play: %{y:+.2f}<br>"
                 "Success Rate: %{customdata[1]:.1%}<br>"
                 "Attempts: %{customdata[0]}"
@@ -871,7 +961,7 @@ with tab4:
             ),
         ),
         customdata=list(zip(
-            df_sr_show["epa_per_play"],
+            df_sr_show["epa_per_play"].map(lambda v: f"{v:+.2f}"),
             df_sr_show["attempts"].map(lambda v: f"{int(v)}"),
             df_sr_show["touchdowns"].map(lambda v: f"{int(v)}"),
             df_sr_show["interceptions"].map(lambda v: f"{int(v)}"),
@@ -884,7 +974,7 @@ with tab4:
             "<span style='font-size:15px'><b>%{y}</b></span><br>"
             f"Season: %{{customdata[6]}}<br>"
             "Success Rate: %{customdata[5]}<br>"
-            "EPA/play: %{customdata[0]:+.2f}<br>"
+            "EPA/play: %{customdata[0]}<br>"
             "Attempts: %{customdata[1]}<br>"
             "TDs: %{customdata[2]}  ·  INTs: %{customdata[3]}"
             "<extra></extra>"
@@ -957,6 +1047,10 @@ with tab5:
         .sort_values(["season", "epa_per_play"], ascending=[False, False])
         .style
         .format({
+            "attempts":       "{:.0f}",
+            "touchdowns":     "{:.0f}",
+            "interceptions":  "{:.0f}",
+            "sacks":          "{:.0f}",
             "epa_per_play":   "{:+.2f}",
             "epa_total":      "{:+.1f}",
             "success_rate":   "{:.1%}",
@@ -972,6 +1066,11 @@ with tab5:
         .background_gradient(subset=["epa_per_play"], cmap="RdBu", vmin=-0.3, vmax=0.3)
         .background_gradient(subset=["success_rate"], cmap="RdBu", vmin=0.35, vmax=0.65)
         .background_gradient(subset=["pressure_drop"], cmap="RdBu_r", vmin=0.2, vmax=1.2)
+        .set_properties(subset=[
+            "season", "attempts", "epa_per_play", "epa_total", "success_rate",
+            "cpoe", "completion_pct", "touchdowns", "interceptions", "sacks", "air_yards",
+            "epa_clean", "epa_pressure", "pressure_drop", "pressure_rate", "time_to_throw",
+        ], **{"text-align": "center"})
     )
 
     st.dataframe(
@@ -983,5 +1082,7 @@ with tab5:
             "team_logo_espn": st.column_config.ImageColumn("Logo",  width="small"),
         },
     )
-    csv = agg_tab5[cols_display].to_csv(index=False)
+    cols_export = [c for c in cols_display if c not in ("headshot_url", "team_logo_espn")]
+    csv = agg_tab5[cols_export].to_csv(index=False)
+    
     st.download_button("Download CSV", csv, "qb_epa.csv", "text/csv")
