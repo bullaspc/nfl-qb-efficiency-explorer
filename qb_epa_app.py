@@ -247,12 +247,13 @@ def load_qb_records(seasons: list[int]) -> pd.DataFrame:
         .sum()
         .reset_index()
     )
+    wl["games_started"] = wl["w"] + wl["l"] + wl["t"]
     wl["record"] = wl.apply(
         lambda r: f"{int(r.w)}-{int(r.l)}-{int(r.t)}" if r.t > 0 else f"{int(r.w)}-{int(r.l)}",
         axis=1,
     )
     wl.rename(columns={"passer_player_name": "QB"}, inplace=True)
-    return wl[["season", "QB", "season_type", "record"]]
+    return wl[["season", "QB", "season_type", "record", "games_started"]]
 
 
 @st.cache_data(show_spinner=False)
@@ -437,14 +438,14 @@ agg["team_logo_espn"] = agg["team_logo_espn"].fillna("")
 # ── Enrich with QB-specific W-L records (games started) ───────────────────────
 _qb_wl = load_qb_records(seasons)
 _reg = (
-    _qb_wl[_qb_wl["season_type"] == "REG"][["season", "QB", "record"]]
-    .rename(columns={"record": "reg_record"})
+    _qb_wl[_qb_wl["season_type"] == "REG"][["season", "QB", "record", "games_started"]]
+    .rename(columns={"record": "reg_record", "games_started": "reg_games_started"})
     .drop_duplicates(["season", "QB"])
     .reset_index(drop=True)
 )
 _post = (
-    _qb_wl[_qb_wl["season_type"] == "POST"][["season", "QB", "record"]]
-    .rename(columns={"record": "post_record"})
+    _qb_wl[_qb_wl["season_type"] == "POST"][["season", "QB", "record", "games_started"]]
+    .rename(columns={"record": "post_record", "games_started": "post_games_started"})
     .drop_duplicates(["season", "QB"])
     .reset_index(drop=True)
 )
@@ -452,6 +453,15 @@ agg = agg.merge(_reg,  on=["season", "QB"], how="left")
 agg = agg.merge(_post, on=["season", "QB"], how="left")
 agg["reg_record"]  = agg["reg_record"].fillna("—")
 agg["post_record"] = agg["post_record"].fillna("—")
+agg["reg_games_started"]  = agg["reg_games_started"].fillna(0).astype(int)
+agg["post_games_started"] = agg["post_games_started"].fillna(0).astype(int)
+# Durability: games started in the relevant context (reg vs post)
+agg["games_started"] = (
+    agg["post_games_started"] if game_type == "Postseason" else agg["reg_games_started"]
+)
+
+# ── Enrich with team pass-play weight ─────────────────────────────────────────
+agg = agg.merge(_team_pass_weight, on=["season", "Team"], how="left")
 
 # ── Historical EPA percentile (vs all QB-seasons 2016+, REG, min 150 att) ─────
 _ref_epa = load_epa_reference()
@@ -651,7 +661,8 @@ with tab2:
     with col_ctrl_b:
         size_metric = st.selectbox(
             "Bubble size",
-            ["attempts", "touchdowns", "air_yards", "pressure_rate", "time_to_throw"],
+            ["attempts", "games_started", "pass_play_weight",
+             "touchdowns", "air_yards", "pressure_rate", "time_to_throw"],
             key="scatter_size",
         )
 
