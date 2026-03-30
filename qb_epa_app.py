@@ -137,7 +137,7 @@ _DATA_DIR = Path(__file__).parent / "data"
 _CURRENT_YEAR = 2025
 _PBP_COLS = [
     "season", "week", "passer_player_name", "passer_player_id",
-    "pass_attempt", "epa", "cpoe", "air_yards", "yards_after_catch",
+    "pass_attempt", "rush_attempt", "epa", "cpoe", "air_yards", "yards_after_catch",
     "complete_pass", "interception", "touchdown", "sack",
     "qb_scramble", "posteam", "defteam", "season_type",
     "was_pressure", "time_to_throw",
@@ -284,13 +284,22 @@ def _ordinal(n: float) -> str:
 
 raw = load_pbp(seasons)
 
-# ── Total offensive snap count per team/season (used for dropback_pct) ─────────
-_scrimmage_types = {"pass", "run", "qb_kneel", "qb_spike"}
-_total_snaps = (
-    raw[raw["play_type"].isin(_scrimmage_types)]
-    .groupby(["season", "posteam"])
-    .size()
-    .reset_index(name="total_snaps")
+# ── Team pass-play weight (pass plays / total offensive plays) ─────────────────
+_raw_plays = raw.dropna(subset=["posteam"]).copy()
+_raw_plays["_is_pass"] = (_raw_plays["pass_attempt"].fillna(0) == 1).astype(int)
+_raw_plays["_is_rush"] = (_raw_plays["rush_attempt"].fillna(0) == 1).astype(int)
+_team_pass_weight = (
+    _raw_plays.groupby(["season", "posteam"])
+    .agg(team_pass_plays=("_is_pass", "sum"), team_rush_plays=("_is_rush", "sum"))
+    .reset_index()
+)
+_team_pass_weight["pass_play_weight"] = (
+    _team_pass_weight["team_pass_plays"]
+    / (_team_pass_weight["team_pass_plays"] + _team_pass_weight["team_rush_plays"])
+).round(3)
+_team_pass_weight = (
+    _team_pass_weight[["season", "posteam", "pass_play_weight"]]
+    .rename(columns={"posteam": "Team"})
 )
 
 # ── Filter to dropback plays ───────────────────────────────────────────────────
