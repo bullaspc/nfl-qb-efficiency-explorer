@@ -120,7 +120,7 @@ if not seasons:
 def load_pbp(seasons: list[int]) -> pd.DataFrame:
     wanted = [
         "season", "week", "passer_player_name", "passer_player_id",
-        "pass_attempt", "epa", "cpoe", "air_yards", "yards_after_catch",
+        "pass_attempt", "rush_attempt", "epa", "cpoe", "air_yards", "yards_after_catch",
         "complete_pass", "interception", "touchdown", "sack",
         "qb_scramble", "posteam", "defteam", "season_type",
         "was_pressure", "time_to_throw",
@@ -210,15 +210,34 @@ def load_qb_records(seasons: list[int]) -> pd.DataFrame:
         .sum()
         .reset_index()
     )
+    wl["games_started"] = wl["w"] + wl["l"] + wl["t"]
     wl["record"] = wl.apply(
         lambda r: f"{int(r.w)}-{int(r.l)}-{int(r.t)}" if r.t > 0 else f"{int(r.w)}-{int(r.l)}",
         axis=1,
     )
     wl.rename(columns={"passer_player_name": "QB"}, inplace=True)
-    return wl[["season", "QB", "season_type", "record"]]
+    return wl[["season", "QB", "season_type", "record", "games_started"]]
 
 
 raw = load_pbp(seasons)
+
+# ── Team pass-play weight (pass plays / total offensive plays) ─────────────────
+_raw_plays = raw.dropna(subset=["posteam"]).copy()
+_raw_plays["_is_pass"] = (_raw_plays["pass_attempt"].fillna(0) == 1).astype(int)
+_raw_plays["_is_rush"] = (_raw_plays["rush_attempt"].fillna(0) == 1).astype(int)
+_team_pass_weight = (
+    _raw_plays.groupby(["season", "posteam"])
+    .agg(team_pass_plays=("_is_pass", "sum"), team_rush_plays=("_is_rush", "sum"))
+    .reset_index()
+)
+_team_pass_weight["pass_play_weight"] = (
+    _team_pass_weight["team_pass_plays"]
+    / (_team_pass_weight["team_pass_plays"] + _team_pass_weight["team_rush_plays"])
+).round(3)
+_team_pass_weight = (
+    _team_pass_weight[["season", "posteam", "pass_play_weight"]]
+    .rename(columns={"posteam": "Team"})
+)
 
 # ── Filter to dropback plays ───────────────────────────────────────────────────
 pbp = raw[
@@ -301,14 +320,14 @@ agg["team_logo_espn"] = agg["team_logo_espn"].fillna("")
 # ── Enrich with QB-specific W-L records (games started) ───────────────────────
 _qb_wl = load_qb_records(seasons)
 _reg = (
-    _qb_wl[_qb_wl["season_type"] == "REG"][["season", "QB", "record"]]
-    .rename(columns={"record": "reg_record"})
+    _qb_wl[_qb_wl["season_type"] == "REG"][["season", "QB", "record", "games_started"]]
+    .rename(columns={"record": "reg_record", "games_started": "reg_games_started"})
     .drop_duplicates(["season", "QB"])
     .reset_index(drop=True)
 )
 _post = (
-    _qb_wl[_qb_wl["season_type"] == "POST"][["season", "QB", "record"]]
-    .rename(columns={"record": "post_record"})
+    _qb_wl[_qb_wl["season_type"] == "POST"][["season", "QB", "record", "games_started"]]
+    .rename(columns={"record": "post_record", "games_started": "post_games_started"})
     .drop_duplicates(["season", "QB"])
     .reset_index(drop=True)
 )
@@ -316,6 +335,15 @@ agg = agg.merge(_reg,  on=["season", "QB"], how="left")
 agg = agg.merge(_post, on=["season", "QB"], how="left")
 agg["reg_record"]  = agg["reg_record"].fillna("—")
 agg["post_record"] = agg["post_record"].fillna("—")
+agg["reg_games_started"]  = agg["reg_games_started"].fillna(0).astype(int)
+agg["post_games_started"] = agg["post_games_started"].fillna(0).astype(int)
+# Durability: games started in the relevant context (reg vs post)
+agg["games_started"] = (
+    agg["post_games_started"] if game_type == "Postseason" else agg["reg_games_started"]
+)
+
+# ── Enrich with team pass-play weight ─────────────────────────────────────────
+agg = agg.merge(_team_pass_weight, on=["season", "Team"], how="left")
 
 agg = agg.reset_index(drop=True)
 
@@ -506,7 +534,8 @@ with tab2:
     with col_ctrl_b:
         size_metric = st.selectbox(
             "Bubble size",
-            ["attempts", "touchdowns", "air_yards", "pressure_rate", "time_to_throw"],
+            ["attempts", "games_started", "pass_play_weight",
+             "touchdowns", "air_yards", "pressure_rate", "time_to_throw"],
             key="scatter_size",
         )
 
@@ -536,7 +565,8 @@ with tab2:
                              "season",
                              "reg_record" if wl_type == "Regular Season" else "post_record",
                              "epa_clean", "epa_pressure", "pressure_drop",
-                             "pressure_rate", "time_to_throw"],
+                             "pressure_rate", "time_to_throw",
+                             "games_started", "pass_play_weight"],
                 labels={
                     "cpoe": "Completion % Over Expected (CPOE)",
                     "epa_per_play": "EPA per Dropback",
@@ -559,7 +589,9 @@ with tab2:
                     "<b>── Pressure ──</b><br>"
                     "Clean EPA: %{customdata[9]:+.2f}  ·  Pressure EPA: %{customdata[10]:+.2f}<br>"
                     "Pressure Drop: %{customdata[11]:.2f}  ·  Pressure Rate: %{customdata[12]:.1%}<br>"
-                    "Time to Throw: %{customdata[13]:.2f}s"
+                    "Time to Throw: %{customdata[13]:.2f}s<br>"
+                    "<b>── Availability & Usage ──</b><br>"
+                    "Games Started: %{customdata[14]}  ·  Team Pass%: %{customdata[15]:.1%}"
                     "<extra></extra>"
                 ),
             )
@@ -946,7 +978,7 @@ with tab5:
 
     cols_display = [
         "headshot_url", "team_logo_espn",
-        "season", "QB", "Team", "attempts",
+        "season", "QB", "Team", "attempts", "games_started", "pass_play_weight",
         "epa_per_play", "epa_total", "success_rate",
         "cpoe", "completion_pct", "touchdowns", "interceptions", "sacks", "air_yards",
         "epa_clean", "epa_pressure", "pressure_drop", "pressure_rate", "time_to_throw",
@@ -957,17 +989,18 @@ with tab5:
         .sort_values(["season", "epa_per_play"], ascending=[False, False])
         .style
         .format({
-            "epa_per_play":   "{:+.2f}",
-            "epa_total":      "{:+.1f}",
-            "success_rate":   "{:.1%}",
-            "completion_pct": "{:.1%}",
-            "cpoe":           "{:+.2f}",
-            "air_yards":      "{:.1f}",
-            "epa_clean":      "{:+.3f}",
-            "epa_pressure":   "{:+.3f}",
-            "pressure_drop":  "{:.3f}",
-            "pressure_rate":  "{:.1%}",
-            "time_to_throw":  "{:.2f}s",
+            "epa_per_play":     "{:+.2f}",
+            "epa_total":        "{:+.1f}",
+            "success_rate":     "{:.1%}",
+            "completion_pct":   "{:.1%}",
+            "cpoe":             "{:+.2f}",
+            "air_yards":        "{:.1f}",
+            "epa_clean":        "{:+.3f}",
+            "epa_pressure":     "{:+.3f}",
+            "pressure_drop":    "{:.3f}",
+            "pressure_rate":    "{:.1%}",
+            "time_to_throw":    "{:.2f}s",
+            "pass_play_weight": "{:.1%}",
         }, na_rep="—")
         .background_gradient(subset=["epa_per_play"], cmap="RdBu", vmin=-0.3, vmax=0.3)
         .background_gradient(subset=["success_rate"], cmap="RdBu", vmin=0.35, vmax=0.65)
