@@ -142,6 +142,7 @@ _PBP_COLS = [
     "qb_scramble", "posteam", "defteam", "season_type",
     "was_pressure", "time_to_throw",
     "score_differential", "qtr", "wp",
+    "down", "ydstogo", "game_id",
 ]
 
 
@@ -318,6 +319,7 @@ agg = (
     pbp.groupby(["season", "passer_player_name", "posteam"])
     .agg(
         attempts=("pass_attempt", "sum"),
+        dropbacks=("epa", "count"),          # all dropbacks incl. scrambles
         player_id=("passer_player_id", "first"),
         epa_total=("epa", "sum"),
         epa_per_play=("epa", "mean"),
@@ -357,6 +359,57 @@ agg = agg.merge(
     _epa_split[["season", "QB", "Team", "epa_clean", "epa_pressure", "pressure_drop"]],
     on=["season", "QB", "Team"], how="left",
 )
+
+# ── Snap & usage metrics ──────────────────────────────────────────────────────
+# Team totals for share calculations
+_team_totals = (
+    pbp.groupby(["season", "posteam"])
+    .agg(team_dropbacks=("epa", "count"), team_epa=("epa", "sum"))
+    .reset_index()
+    .rename(columns={"posteam": "Team"})
+)
+
+# Games played per QB (unique game_ids)
+_games = (
+    pbp.groupby(["season", "passer_player_name", "posteam"])["game_id"]
+    .nunique()
+    .reset_index(name="games_played")
+    .rename(columns={"passer_player_name": "QB", "posteam": "Team"})
+)
+
+# Weekly EPA/dropback std dev (consistency)
+_weekly_epa_std = (
+    pbp.groupby(["season", "week", "passer_player_name", "posteam"])["epa"]
+    .mean()
+    .reset_index(name="weekly_epa")
+    .groupby(["season", "passer_player_name", "posteam"])["weekly_epa"]
+    .std()
+    .reset_index(name="weekly_epa_std")
+    .rename(columns={"passer_player_name": "QB", "posteam": "Team"})
+)
+
+# Passing-down dropback rate (3rd or 4th & ≥5 yards to go)
+_pass_down_rate = (
+    pbp.assign(is_passing_down=(pbp["down"].isin([3, 4]) & (pbp["ydstogo"] >= 5)).astype(float))
+    .groupby(["season", "passer_player_name", "posteam"])["is_passing_down"]
+    .mean()
+    .reset_index(name="passing_down_rate")
+    .rename(columns={"passer_player_name": "QB", "posteam": "Team"})
+)
+
+# Join and derive
+agg = agg.merge(_team_totals, on=["season", "Team"], how="left")
+agg = agg.merge(_games,       on=["season", "QB", "Team"], how="left")
+agg = agg.merge(_weekly_epa_std, on=["season", "QB", "Team"], how="left")
+agg = agg.merge(_pass_down_rate, on=["season", "QB", "Team"], how="left")
+
+agg["team_dropback_share"] = (agg["dropbacks"] / agg["team_dropbacks"]).round(3)
+agg["team_epa_share"]      = (agg["epa_total"]  / agg["team_epa"]).round(3)
+agg["snap_adj_epa"]        = (agg["epa_per_play"] * agg["team_dropback_share"]).round(3)
+agg["dropbacks_per_game"]  = (agg["dropbacks"] / agg["games_played"]).round(1)
+agg["weekly_epa_std"]      = agg["weekly_epa_std"].round(3)
+agg["passing_down_rate"]   = agg["passing_down_rate"].round(3)
+agg.drop(columns=["team_dropbacks", "team_epa"], inplace=True)
 
 # ── Enrich with headshots & team logos ────────────────────────────────────────
 rosters_df = load_rosters(seasons)
@@ -459,13 +512,14 @@ def _clean_fig(fig: go.Figure, **overrides) -> go.Figure:
 
 
 # ── Tab layout ─────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     [
         "▦  EPA Rank",       # ranking bars — primary efficiency metric
         "◎  EPA vs CPOE",   # bivariate scatter — efficiency × accuracy
         "⟠  Trends",         # multi-QB longitudinal + weekly breakdown
         "✓  Success Rate",   # secondary ranking — % positive-EPA dropbacks
         "⊞  Data",           # raw table + CSV export
+        "◈  Usage",          # snap share & dropback weight metrics
     ]
 )
 
@@ -1036,10 +1090,12 @@ with tab5:
 
     cols_display = [
         "headshot_url", "team_logo_espn",
-        "season", "QB", "Team", "attempts",
+        "season", "QB", "Team", "attempts", "dropbacks",
         "epa_per_play", "epa_total", "success_rate",
         "cpoe", "completion_pct", "touchdowns", "interceptions", "sacks", "air_yards",
         "epa_clean", "epa_pressure", "pressure_drop", "pressure_rate", "time_to_throw",
+        "dropbacks_per_game", "team_dropback_share", "team_epa_share",
+        "snap_adj_epa", "weekly_epa_std", "passing_down_rate",
     ]
 
     styled = (
@@ -1047,29 +1103,38 @@ with tab5:
         .sort_values(["season", "epa_per_play"], ascending=[False, False])
         .style
         .format({
-            "attempts":       "{:.0f}",
-            "touchdowns":     "{:.0f}",
-            "interceptions":  "{:.0f}",
-            "sacks":          "{:.0f}",
-            "epa_per_play":   "{:+.2f}",
-            "epa_total":      "{:+.1f}",
-            "success_rate":   "{:.1%}",
-            "completion_pct": "{:.1%}",
-            "cpoe":           "{:+.2f}",
-            "air_yards":      "{:.1f}",
-            "epa_clean":      "{:+.3f}",
-            "epa_pressure":   "{:+.3f}",
-            "pressure_drop":  "{:.3f}",
-            "pressure_rate":  "{:.1%}",
-            "time_to_throw":  "{:.2f}s",
+            "attempts":             "{:.0f}",
+            "dropbacks":            "{:.0f}",
+            "touchdowns":           "{:.0f}",
+            "interceptions":        "{:.0f}",
+            "sacks":                "{:.0f}",
+            "epa_per_play":         "{:+.2f}",
+            "epa_total":            "{:+.1f}",
+            "success_rate":         "{:.1%}",
+            "completion_pct":       "{:.1%}",
+            "cpoe":                 "{:+.2f}",
+            "air_yards":            "{:.1f}",
+            "epa_clean":            "{:+.3f}",
+            "epa_pressure":         "{:+.3f}",
+            "pressure_drop":        "{:.3f}",
+            "pressure_rate":        "{:.1%}",
+            "time_to_throw":        "{:.2f}s",
+            "dropbacks_per_game":   "{:.1f}",
+            "team_dropback_share":  "{:.1%}",
+            "team_epa_share":       "{:.1%}",
+            "snap_adj_epa":         "{:+.3f}",
+            "weekly_epa_std":       "{:.3f}",
+            "passing_down_rate":    "{:.1%}",
         }, na_rep="—")
         .background_gradient(subset=["epa_per_play"], cmap="RdBu", vmin=-0.3, vmax=0.3)
         .background_gradient(subset=["success_rate"], cmap="RdBu", vmin=0.35, vmax=0.65)
         .background_gradient(subset=["pressure_drop"], cmap="RdBu_r", vmin=0.2, vmax=1.2)
         .set_properties(subset=[
-            "season", "attempts", "epa_per_play", "epa_total", "success_rate",
+            "season", "attempts", "dropbacks", "epa_per_play", "epa_total", "success_rate",
             "cpoe", "completion_pct", "touchdowns", "interceptions", "sacks", "air_yards",
             "epa_clean", "epa_pressure", "pressure_drop", "pressure_rate", "time_to_throw",
+            "dropbacks_per_game", "team_dropback_share", "team_epa_share",
+            "snap_adj_epa", "weekly_epa_std", "passing_down_rate",
         ], **{"text-align": "center"})
     )
 
@@ -1086,3 +1151,186 @@ with tab5:
     csv = agg_tab5[cols_export].to_csv(index=False)
     
     st.download_button("Download CSV", csv, "qb_epa.csv", "text/csv")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 6 – Snap & Usage
+# ══════════════════════════════════════════════════════════════════════════════
+with tab6:
+    _all_seasons6 = sorted(agg["season"].unique(), reverse=True)
+    seasons_tab6 = st.multiselect(
+        "Season(s)", _all_seasons6, default=[_all_seasons6[0]], key="usage_season"
+    )
+    if not seasons_tab6:
+        st.info("Select at least one season.")
+        st.stop()
+
+    df_usage = (
+        agg[agg["season"].isin(seasons_tab6)]
+        .dropna(subset=["team_dropback_share", "epa_per_play"])
+        .reset_index(drop=True)
+    )
+
+    st.markdown(
+        "**Dropback share** = QB dropbacks ÷ total team dropbacks · "
+        "**Snap-adj EPA** = EPA/dropback × dropback share · "
+        "**Team EPA share** = QB dropback EPA ÷ team dropback EPA"
+    )
+
+    col_u1, col_u2 = st.columns([3, 2])
+
+    # ── Scatter: team_dropback_share vs epa_per_play ──────────────────────────
+    with col_u1:
+        fig_u = go.Figure()
+        avg_share = df_usage["team_dropback_share"].mean()
+        avg_epa   = df_usage["epa_per_play"].mean()
+
+        fig_u.add_trace(go.Scatter(
+            x=df_usage["team_dropback_share"],
+            y=df_usage["epa_per_play"],
+            mode="markers+text",
+            text=df_usage["QB"].str.split(".").str[-1],  # last name
+            textposition="top center",
+            textfont=dict(size=10),
+            marker=dict(
+                size=df_usage["team_epa_share"].clip(0).mul(60).add(6),
+                color=df_usage["snap_adj_epa"],
+                colorscale=_DIVERG,
+                cmid=0,
+                showscale=True,
+                colorbar=dict(
+                    title=dict(text="Snap-adj EPA", side="right"),
+                    thickness=10, len=0.55, tickformat="+.3f", outlinewidth=0,
+                ),
+                line=dict(width=0.5, color="#555555"),
+            ),
+            customdata=list(zip(
+                df_usage["QB"],
+                df_usage["team_dropback_share"].map(lambda v: f"{v:.1%}"),
+                df_usage["epa_per_play"].map(lambda v: f"{v:+.3f}"),
+                df_usage["team_epa_share"].map(lambda v: f"{v:.1%}"),
+                df_usage["snap_adj_epa"].map(lambda v: f"{v:+.3f}"),
+                df_usage["dropbacks_per_game"].map(lambda v: f"{v:.1f}"),
+                df_usage["weekly_epa_std"].map(lambda v: f"{v:.3f}" if pd.notna(v) else "—"),
+            )),
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Dropback share: %{customdata[1]}<br>"
+                "EPA/dropback: %{customdata[2]}<br>"
+                "Team EPA share: %{customdata[3]}<br>"
+                "Snap-adj EPA: %{customdata[4]}<br>"
+                "Dropbacks/game: %{customdata[5]}<br>"
+                "Weekly EPA std: %{customdata[6]}"
+                "<extra></extra>"
+            ),
+            name="",
+        ))
+
+        # Quadrant lines
+        for x_ref in [avg_share]:
+            fig_u.add_vline(x=x_ref, line_dash="dot", line_color=_NEUTRAL, opacity=0.5)
+        for y_ref in [avg_epa]:
+            fig_u.add_hline(y=y_ref, line_dash="dot", line_color=_NEUTRAL, opacity=0.5)
+
+        _clean_fig(
+            fig_u,
+            title=dict(
+                text="<b>Scheme Trust vs Efficiency</b>"
+                     "<br><sup>Bubble size = team EPA share · color = snap-adj EPA</sup>",
+                font_size=14, x=0,
+            ),
+            xaxis=dict(
+                title="Dropback Share of Team Dropbacks",
+                tickformat=".0%",
+                showline=True, linecolor="#cccccc", showgrid=False,
+                zeroline=False,
+            ),
+            yaxis=dict(
+                title="EPA per Dropback",
+                showgrid=True, gridcolor="rgba(0,0,0,0.06)", zeroline=False,
+            ),
+            height=520,
+            showlegend=False,
+        )
+        st.plotly_chart(fig_u, width="stretch")
+
+    # ── Bar: snap-adjusted EPA ranking ───────────────────────────────────────
+    with col_u2:
+        df_snap_bar = df_usage.sort_values("snap_adj_epa").reset_index(drop=True)
+        lg_avg_snap = df_snap_bar["snap_adj_epa"].mean()
+
+        fig_snap = go.Figure(go.Bar(
+            x=df_snap_bar["snap_adj_epa"],
+            y=df_snap_bar["QB"].str.split(".").str[-1],
+            orientation="h",
+            marker=dict(
+                color=df_snap_bar["snap_adj_epa"],
+                colorscale=_DIVERG,
+                cmid=lg_avg_snap,
+                showscale=False,
+            ),
+            customdata=list(zip(
+                df_snap_bar["QB"],
+                df_snap_bar["snap_adj_epa"].map(lambda v: f"{v:+.3f}"),
+                df_snap_bar["team_dropback_share"].map(lambda v: f"{v:.1%}"),
+            )),
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Snap-adj EPA: %{customdata[1]}<br>"
+                "Dropback share: %{customdata[2]}"
+                "<extra></extra>"
+            ),
+            name="",
+        ))
+        fig_snap.add_vline(
+            x=lg_avg_snap, line_dash="dot", line_color=_NEUTRAL, opacity=0.6,
+            annotation_text=f"avg {lg_avg_snap:+.3f}",
+            annotation_position="top right",
+            annotation_font_size=9, annotation_font_color=_NEUTRAL,
+        )
+        _clean_fig(
+            fig_snap,
+            title=dict(
+                text="<b>Snap-Adj EPA Rank</b>"
+                     "<br><sup>EPA/play × dropback share</sup>",
+                font_size=13, x=0,
+            ),
+            xaxis=dict(
+                title="Snap-adj EPA", tickformat="+.3f",
+                showline=True, linecolor="#cccccc", showgrid=False, zeroline=False,
+            ),
+            yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=11)),
+            height=max(400, len(df_snap_bar) * 28),
+            showlegend=False,
+            margin=dict(l=10, r=20, t=70, b=40),
+        )
+        st.plotly_chart(fig_snap, width="stretch")
+
+    # ── Usage summary table ───────────────────────────────────────────────────
+    st.markdown("#### Usage detail")
+    usage_cols = [
+        "season", "QB", "Team", "dropbacks", "dropbacks_per_game",
+        "team_dropback_share", "team_epa_share", "snap_adj_epa",
+        "weekly_epa_std", "passing_down_rate",
+    ]
+    df_usage_tbl = (
+        df_usage[usage_cols]
+        .sort_values("snap_adj_epa", ascending=False)
+        .style
+        .format({
+            "dropbacks":           "{:.0f}",
+            "dropbacks_per_game":  "{:.1f}",
+            "team_dropback_share": "{:.1%}",
+            "team_epa_share":      "{:.1%}",
+            "snap_adj_epa":        "{:+.3f}",
+            "weekly_epa_std":      "{:.3f}",
+            "passing_down_rate":   "{:.1%}",
+        }, na_rep="—")
+        .background_gradient(subset=["snap_adj_epa"], cmap="RdBu", vmin=-0.08, vmax=0.08)
+        .background_gradient(subset=["team_dropback_share"], cmap="Blues", vmin=0.3, vmax=1.0)
+        .set_properties(subset=[
+            "dropbacks", "dropbacks_per_game", "team_dropback_share",
+            "team_epa_share", "snap_adj_epa", "weekly_epa_std", "passing_down_rate",
+        ], **{"text-align": "center"})
+    )
+    st.dataframe(df_usage_tbl, hide_index=True, width="stretch")
