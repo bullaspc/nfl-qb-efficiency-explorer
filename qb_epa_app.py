@@ -283,6 +283,15 @@ def _ordinal(n: float) -> str:
 
 raw = load_pbp(seasons)
 
+# ── Total offensive snap count per team/season (used for dropback_pct) ─────────
+_scrimmage_types = {"pass", "run", "qb_kneel", "qb_spike"}
+_total_snaps = (
+    raw[raw["play_type"].isin(_scrimmage_types)]
+    .groupby(["season", "posteam"])
+    .size()
+    .reset_index(name="total_snaps")
+)
+
 # ── Filter to dropback plays ───────────────────────────────────────────────────
 pbp = raw[
     (raw["pass_attempt"] == 1) | (raw["qb_scramble"] == 1)

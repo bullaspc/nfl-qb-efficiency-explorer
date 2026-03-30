@@ -10,11 +10,14 @@ An interactive Streamlit dashboard for exploring NFL quarterback efficiency metr
 
 ## Features
 
+### League snapshot
+Five summary metric cards shown above the tabs: qualifying QB count, best EPA/play, best CPOE, most TDs, and best success rate for the current filter set.
+
 ### Global filters (sidebar)
-- **Season(s)** — single or multi-season selection from 2016 to present
+- **Season(s)** — single or multi-season selection (2016–2025)
 - **Game type** — Regular Season, Postseason, or Both
-- **Week range** — slider for regular-season weeks
-- **Min. pass attempts** — qualifying threshold to filter out small samples
+- **Week range** — slider for regular-season weeks (disabled for Postseason)
+- **Min. pass attempts** — qualifying threshold to filter out small samples (fixed at 5 for Postseason)
 - **W-L record display** — choose whether hover tooltips show the Regular Season or Postseason team record
 
 ### Five tabs
@@ -40,6 +43,12 @@ Every chart shows on hover: QB name, team, season, W-L record, EPA/play, success
 | **EPA / dropback** | Mean EPA across all pass attempts and QB scrambles |
 | **CPOE** | Completion % Over Expected — actual completion rate minus model-predicted rate |
 | **Success rate** | % of dropbacks where EPA > 0 |
+| **EPA (clean pocket)** | Mean EPA on non-pressured dropbacks |
+| **EPA (under pressure)** | Mean EPA on pressured dropbacks |
+| **Pressure drop** | EPA clean pocket minus EPA under pressure — measures how much a QB's performance declines when pressured |
+| **Pressure rate** | % of dropbacks where the QB faced pressure |
+| **Air yards** | Mean air distance of pass attempts (depth of target) |
+| **Time to throw** | Mean seconds from snap to release |
 
 Data comes from nflfastR play-by-play, which covers the 2016 season onward.
 
@@ -80,14 +89,15 @@ README.md
 ### Data flow
 
 ```
-load_pbp()          nflfastR play-by-play
-load_rosters()      Weekly rosters → QB headshot URLs
-load_teams()        Team logos and colors
-load_schedules()    Schedule results → per-team W-L records
+load_pbp()           nflfastR play-by-play
+load_rosters()       Weekly rosters → QB headshot URLs
+load_teams()         Team logos and colors
+load_qb_records()    Schedule results → per-QB W-L records (games started)
        │
        ▼
 Filter dropbacks (pass_attempt == 1 | qb_scramble == 1)
 Apply game type / week range / season filters
+Compute pressure splits (epa_clean, epa_pressure, pressure_drop)
        │
        ▼
 Aggregate per (season, QB, team)
