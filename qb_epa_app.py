@@ -688,6 +688,7 @@ with tab2:
             df_sc["_epa_clean_fmt"]  = df_sc["epa_clean"].map(lambda v: _fmt(v, "+.2f"))
             df_sc["_epa_press_fmt"]  = df_sc["epa_pressure"].map(lambda v: _fmt(v, "+.2f"))
             df_sc["_pdrop_fmt"]      = df_sc["pressure_drop"].map(lambda v: _fmt(v, ".2f"))
+            df_sc["_cpoe_fmt"]       = df_sc["cpoe"].map(lambda v: _fmt(v, "+.2f"))
 
             avg_epa_sc = df_sc["epa_per_play"].mean()
             avg_cpoe_sc = df_sc["cpoe"].mean()
@@ -708,7 +709,7 @@ with tab2:
                              "season",
                              "reg_record" if wl_type == "Regular Season" else "post_record",
                              "_epa_clean_fmt", "_epa_press_fmt", "_pdrop_fmt",
-                             "pressure_rate", "time_to_throw", "_epa_fmt"],
+                             "pressure_rate", "time_to_throw", "_epa_fmt", "_cpoe_fmt"],
                 labels={
                     "cpoe": "Completion % Over Expected (CPOE)",
                     "epa_per_play": "EPA per Dropback",
@@ -724,7 +725,7 @@ with tab2:
                 hovertemplate=(
                     "<span style='font-size:16px'><b>%{text} · %{customdata[0]}</b></span><br>"
                     f"Season: %{{customdata[7]}}  ·  {wl_type} Record: %{{customdata[8]}}<br>"
-                    "EPA/play: %{customdata[14]}  ·  CPOE: %{x:+.2f}%<br>"
+                    "EPA/play: %{customdata[14]}  ·  CPOE: %{customdata[15]}%<br>"
                     "Success Rate: %{customdata[5]:.1%}<br>"
                     "Attempts: %{customdata[1]:.0f}  ·  TDs: %{customdata[2]:.0f}  ·  INTs: %{customdata[3]:.0f}<br>"
                     "Comp%: %{customdata[4]:.1%}  ·  AvgAY: %{customdata[6]:.1f}<br>"
