@@ -724,7 +724,7 @@ with tab2:
                 hovertemplate=(
                     "<span style='font-size:16px'><b>%{text} · %{customdata[0]}</b></span><br>"
                     f"Season: %{{customdata[7]}}  ·  {wl_type} Record: %{{customdata[8]}}<br>"
-                    "EPA/play: %{customdata[14]}  ·  CPOE: %{x:+.1f}%<br>"
+                    "EPA/play: %{customdata[14]}  ·  CPOE: %{x:+.2f}%<br>"
                     "Success Rate: %{customdata[5]:.1%}<br>"
                     "Attempts: %{customdata[1]:.0f}  ·  TDs: %{customdata[2]:.0f}  ·  INTs: %{customdata[3]:.0f}<br>"
                     "Comp%: %{customdata[4]:.1%}  ·  AvgAY: %{customdata[6]:.1f}<br>"
@@ -737,22 +737,6 @@ with tab2:
             )
 
             # Headshot images at each QB's position on the scatter
-            x_range = df_sc["cpoe"].max() - df_sc["cpoe"].min()
-            y_range = df_sc["epa_per_play"].max() - df_sc["epa_per_play"].min()
-            img_w = (x_range or 1.0) * 0.055
-            img_h = (y_range or 0.1) * 0.13
-            for _, row in df_sc.iterrows():
-                if row["headshot_url"]:
-                    fig_sc.add_layout_image(dict(
-                        source=row["headshot_url"],
-                        x=row["cpoe"],
-                        y=row["epa_per_play"],
-                        xref="x", yref="y",
-                        sizex=img_w, sizey=img_h,
-                        xanchor="center", yanchor="middle",
-                        layer="above",
-                    ))
-
             # Reference lines at league averages
             fig_sc.add_hline(
                 y=avg_epa_sc, line_dash="dot", line_color=_NEUTRAL, opacity=0.6,
@@ -762,7 +746,7 @@ with tab2:
             )
             fig_sc.add_vline(
                 x=avg_cpoe_sc, line_dash="dot", line_color=_NEUTRAL, opacity=0.6,
-                annotation_text=f"Avg CPOE {avg_cpoe_sc:+.1f}%",
+                annotation_text=f"Avg CPOE {avg_cpoe_sc:+.2f}%",
                 annotation_position="top left",
                 annotation_font_size=14, annotation_font_color=_NEUTRAL,
             )
@@ -1143,16 +1127,16 @@ with tab5:
             "completion_pct":       "{:.1%}",
             "cpoe":                 "{:+.2f}",
             "air_yards":            "{:.1f}",
-            "epa_clean":            "{:+.3f}",
-            "epa_pressure":         "{:+.3f}",
-            "pressure_drop":        "{:.3f}",
+            "epa_clean":            "{:+.2f}",
+            "epa_pressure":         "{:+.2f}",
+            "pressure_drop":        "{:.2f}",
             "pressure_rate":        "{:.1%}",
             "time_to_throw":        "{:.2f}s",
             "dropbacks_per_game":   "{:.1f}",
             "team_dropback_share":  "{:.1%}",
             "team_epa_share":       "{:.1%}",
-            "snap_adj_epa":         "{:+.3f}",
-            "weekly_epa_std":       "{:.3f}",
+            "snap_adj_epa":         "{:+.2f}",
+            "weekly_epa_std":       "{:.2f}",
             "passing_down_rate":    "{:.1%}",
         }, na_rep="—")
         .background_gradient(subset=["epa_per_play"], cmap="RdBu", vmin=-0.3, vmax=0.3)
@@ -1236,11 +1220,11 @@ with tab6:
             customdata=list(zip(
                 df_usage["QB"],
                 df_usage["team_dropback_share"].map(lambda v: f"{v:.1%}"),
-                df_usage["epa_per_play"].map(lambda v: f"{v:+.3f}"),
+                df_usage["epa_per_play"].map(lambda v: f"{v:+.2f}"),
                 df_usage["team_epa_share"].map(lambda v: f"{v:.1%}"),
-                df_usage["snap_adj_epa"].map(lambda v: f"{v:+.3f}"),
+                df_usage["snap_adj_epa"].map(lambda v: f"{v:+.2f}"),
                 df_usage["dropbacks_per_game"].map(lambda v: f"{v:.1f}"),
-                df_usage["weekly_epa_std"].map(lambda v: f"{v:.3f}" if pd.notna(v) else "—"),
+                df_usage["weekly_epa_std"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "—"),
             )),
             hovertemplate=(
                 "<b>%{customdata[0]}</b><br>"
@@ -1300,7 +1284,7 @@ with tab6:
             ),
             customdata=list(zip(
                 df_snap_bar["QB"],
-                df_snap_bar["snap_adj_epa"].map(lambda v: f"{v:+.3f}"),
+                df_snap_bar["snap_adj_epa"].map(lambda v: f"{v:+.2f}"),
                 df_snap_bar["team_dropback_share"].map(lambda v: f"{v:.1%}"),
             )),
             hovertemplate=(
@@ -1313,7 +1297,7 @@ with tab6:
         ))
         fig_snap.add_vline(
             x=lg_avg_snap, line_dash="dot", line_color=_NEUTRAL, opacity=0.6,
-            annotation_text=f"avg {lg_avg_snap:+.3f}",
+            annotation_text=f"avg {lg_avg_snap:+.2f}",
             annotation_position="top right",
             annotation_font_size=9, annotation_font_color=_NEUTRAL,
         )
@@ -1325,7 +1309,7 @@ with tab6:
                 font_size=13, x=0,
             ),
             xaxis=dict(
-                title="Snap-adj EPA", tickformat="+.3f",
+                title="Snap-adj EPA", tickformat="+.2f",
                 showline=True, linecolor="#cccccc", showgrid=False, zeroline=False,
             ),
             yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=11)),
@@ -1351,8 +1335,8 @@ with tab6:
             "dropbacks_per_game":  "{:.1f}",
             "team_dropback_share": "{:.1%}",
             "team_epa_share":      "{:.1%}",
-            "snap_adj_epa":        "{:+.3f}",
-            "weekly_epa_std":      "{:.3f}",
+            "snap_adj_epa":        "{:+.2f}",
+            "weekly_epa_std":      "{:.2f}",
             "passing_down_rate":   "{:.1%}",
         }, na_rep="—")
         .background_gradient(subset=["snap_adj_epa"], cmap="RdBu", vmin=-0.08, vmax=0.08)
