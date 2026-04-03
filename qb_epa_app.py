@@ -125,7 +125,7 @@ with st.sidebar:
     )
     excl_garbage = st.checkbox(
         "Exclude garbage time", value=False,
-        help="Drops plays with score diff >28 or >17 pts in Q4",
+        help="Drops plays with score diff >28 in any quarter, or >17 pts in Q4/OT",
     )
 
 if not seasons:
@@ -257,9 +257,10 @@ def load_qb_records(seasons: list[int]) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_epa_reference() -> np.ndarray:
+def load_epa_reference(excl_garbage: bool = False) -> np.ndarray:
     """EPA/play per QB-season from 2016+ (REG, min 150 attempts) — historical percentile pool."""
-    ref_cols = ["season", "passer_player_name", "pass_attempt", "epa", "qb_scramble", "season_type"]
+    ref_cols = ["season", "passer_player_name", "pass_attempt", "epa", "qb_scramble",
+                "season_type", "score_differential", "qtr"]
     pbp_ref = pd.concat(
         [_get_pbp(yr)[ref_cols] for yr in range(2016, 2026)],
         ignore_index=True,
@@ -268,6 +269,13 @@ def load_epa_reference() -> np.ndarray:
         ((pbp_ref["pass_attempt"] == 1) | (pbp_ref["qb_scramble"] == 1)) &
         (pbp_ref["season_type"] == "REG")
     ].dropna(subset=["passer_player_name", "epa"])
+    if excl_garbage:
+        garbage = (
+            pbp_ref["score_differential"].isna() |
+            (pbp_ref["score_differential"].abs() > 28) |
+            ((pbp_ref["score_differential"].abs() > 17) & (pbp_ref["qtr"] >= 4))
+        )
+        pbp_ref = pbp_ref[~garbage]
     ref_agg = (
         pbp_ref.groupby(["season", "passer_player_name"])
         .agg(att=("pass_attempt", "sum"), epa_per_play=("epa", "mean"))
@@ -322,8 +330,9 @@ if wp_range != (0.0, 1.0):
     pbp = pbp[pbp["wp"].between(wp_range[0], wp_range[1])]
 if excl_garbage:
     garbage = (
+        pbp["score_differential"].isna() |
         (pbp["score_differential"].abs() > 28) |
-        ((pbp["score_differential"].abs() > 17) & (pbp["qtr"] == 4))
+        ((pbp["score_differential"].abs() > 17) & (pbp["qtr"] >= 4))
     )
     pbp = pbp[~garbage]
 
@@ -473,7 +482,7 @@ agg["games_started"] = (
 agg = agg.merge(_team_pass_weight, on=["season", "Team"], how="left")
 
 # ── Historical EPA percentile (vs all QB-seasons 2016+, REG, min 150 att) ─────
-_ref_epa = load_epa_reference()
+_ref_epa = load_epa_reference(excl_garbage)
 agg["epa_pct"] = agg["epa_per_play"].apply(
     lambda v: _ordinal(((_ref_epa < v).sum() / len(_ref_epa)) * 100) + " pct"
     if pd.notna(v) and len(_ref_epa) > 0 else "—"
