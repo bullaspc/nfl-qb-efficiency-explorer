@@ -321,10 +321,8 @@ if quarters and set(quarters) != {1, 2, 3, 4}:
 if wp_range != (0.0, 1.0):
     pbp = pbp[pbp["wp"].between(wp_range[0], wp_range[1])]
 if excl_garbage:
-    garbage = (
-        (pbp["score_differential"].abs() > 28) |
-        ((pbp["score_differential"].abs() > 17) & (pbp["qtr"] == 4))
-    )
+    sd = pbp["score_differential"].fillna(0)
+    garbage = (sd.abs() > 28) | ((sd.abs() > 17) & (pbp["qtr"] == 4))
     pbp = pbp[~garbage]
 
 # Success = EPA > 0
