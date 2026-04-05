@@ -704,13 +704,21 @@ with tab2:
         if df_sc.empty:
             st.info("No CPOE data available for the selected season / filters.")
         else:
-            # Pre-format EPA columns — Plotly d3 specifiers don't work on customdata
+            # Pre-format all numeric columns — Plotly d3 specifiers are unreliable on customdata
             _fmt = lambda v, spec: format(v, spec) if pd.notna(v) else "—"
-            df_sc["_epa_fmt"]      = df_sc["epa_per_play"].map(lambda v: _fmt(v, "+.2f"))
+            df_sc["_epa_fmt"]        = df_sc["epa_per_play"].map(lambda v: _fmt(v, "+.2f"))
             df_sc["_epa_clean_fmt"]  = df_sc["epa_clean"].map(lambda v: _fmt(v, "+.2f"))
             df_sc["_epa_press_fmt"]  = df_sc["epa_pressure"].map(lambda v: _fmt(v, "+.2f"))
             df_sc["_pdrop_fmt"]      = df_sc["pressure_drop"].map(lambda v: _fmt(v, ".2f"))
             df_sc["_cpoe_fmt"]       = df_sc["cpoe"].map(lambda v: _fmt(v, "+.2f"))
+            df_sc["_sr_fmt"]         = df_sc["success_rate"].map(lambda v: _fmt(v, ".1%"))
+            df_sc["_comp_fmt"]       = df_sc["completion_pct"].map(lambda v: _fmt(v, ".1%"))
+            df_sc["_ay_fmt"]         = df_sc["air_yards"].map(lambda v: _fmt(v, ".1f"))
+            df_sc["_prate_fmt"]      = df_sc["pressure_rate"].map(lambda v: _fmt(v, ".1%"))
+            df_sc["_ttt_fmt"]        = df_sc["time_to_throw"].map(lambda v: _fmt(v, ".2f"))
+            df_sc["_att_fmt"]        = df_sc["attempts"].map(lambda v: f"{int(v)}" if pd.notna(v) else "—")
+            df_sc["_td_fmt"]         = df_sc["touchdowns"].map(lambda v: f"{int(v)}" if pd.notna(v) else "—")
+            df_sc["_int_fmt"]        = df_sc["interceptions"].map(lambda v: f"{int(v)}" if pd.notna(v) else "—")
 
             avg_epa_sc = df_sc["epa_per_play"].mean()
             avg_cpoe_sc = df_sc["cpoe"].mean()
@@ -726,12 +734,12 @@ with tab2:
                 color_continuous_scale=_DIVERG_R,
                 color_continuous_midpoint=df_sc["success_rate"].mean(),
                 custom_data=["Team",
-                             "attempts", "touchdowns", "interceptions",
-                             "completion_pct", "success_rate", "air_yards",
+                             "_att_fmt", "_td_fmt", "_int_fmt",
+                             "_comp_fmt", "_sr_fmt", "_ay_fmt",
                              "season",
                              "reg_record" if wl_type == "Regular Season" else "post_record",
                              "_epa_clean_fmt", "_epa_press_fmt", "_pdrop_fmt",
-                             "pressure_rate", "time_to_throw", "_epa_fmt", "_cpoe_fmt"],
+                             "_prate_fmt", "_ttt_fmt", "_epa_fmt", "_cpoe_fmt"],
                 labels={
                     "cpoe": "Completion % Over Expected (CPOE)",
                     "epa_per_play": "EPA per Dropback",
@@ -748,13 +756,13 @@ with tab2:
                     "<span style='font-size:16px'><b>%{text} · %{customdata[0]}</b></span><br>"
                     f"Season: %{{customdata[7]}}  ·  {wl_type} Record: %{{customdata[8]}}<br>"
                     "EPA/play: %{customdata[14]}  ·  CPOE: %{customdata[15]}%<br>"
-                    "Success Rate: %{customdata[5]:.1%}<br>"
-                    "Attempts: %{customdata[1]:.0f}  ·  TDs: %{customdata[2]:.0f}  ·  INTs: %{customdata[3]:.0f}<br>"
-                    "Comp%: %{customdata[4]:.1%}  ·  AvgAY: %{customdata[6]:.1f}<br>"
+                    "Success Rate: %{customdata[5]}<br>"
+                    "Attempts: %{customdata[1]}  ·  TDs: %{customdata[2]}  ·  INTs: %{customdata[3]}<br>"
+                    "Comp%: %{customdata[4]}  ·  AvgAY: %{customdata[6]}<br>"
                     "<b>── Pressure ──</b><br>"
                     "Clean EPA: %{customdata[9]}  ·  Pressure EPA: %{customdata[10]}<br>"
-                    "Pressure Drop: %{customdata[11]}  ·  Pressure Rate: %{customdata[12]:.1%}<br>"
-                    "Time to Throw: %{customdata[13]:.2f}s"
+                    "Pressure Drop: %{customdata[11]}  ·  Pressure Rate: %{customdata[12]}<br>"
+                    "Time to Throw: %{customdata[13]}s"
                     "<extra></extra>"
                 ),
             )
@@ -948,12 +956,17 @@ with tab3:
                 showscale=False,
                 opacity=0.85,
             ),
-            customdata=weekly[["attempts", "success_rate", "opponent"]].values,
+            customdata=(
+                weekly.assign(
+                    _epa_fmt=weekly["epa_per_play"].map(lambda v: f"{v:+.2f}"),
+                    _sr_fmt=weekly["success_rate"].map(lambda v: f"{v:.1%}"),
+                )[["_epa_fmt", "_sr_fmt", "opponent", "attempts"]].values
+            ),
             hovertemplate=(
                 "<b>Week %{x}  vs  %{customdata[2]}</b><br>"
-                "EPA/play: %{y:+.2f}<br>"
-                "Success Rate: %{customdata[1]:.1%}<br>"
-                "Attempts: %{customdata[0]}"
+                "EPA/play: %{customdata[0]}<br>"
+                "Success Rate: %{customdata[1]}<br>"
+                "Attempts: %{customdata[3]}"
                 "<extra></extra>"
             ),
             # Show attempt count above/below each bar so small-sample weeks are obvious
@@ -969,7 +982,8 @@ with tab3:
             line=dict(color=_POS_CLR, width=2),
             marker=dict(size=6, symbol="circle"),
             yaxis="y2",
-            hovertemplate="Week %{x}  ·  Success Rate: %{y:.1%}<extra></extra>",
+            customdata=weekly["success_rate"].map(lambda v: f"{v:.1%}").values,
+            hovertemplate="Week %{x}  ·  Success Rate: %{customdata}<extra></extra>",
         ))
 
         # Dynamic success-rate axis range: 10-pp padding beyond actual data,
