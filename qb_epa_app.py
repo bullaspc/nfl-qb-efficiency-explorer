@@ -33,6 +33,7 @@ st.markdown(
       .stTabs [data-baseweb="tab-list"] {
         gap: 6px;
         border-bottom: 1px solid rgba(0,0,0,0.08);
+        flex-wrap: wrap;
       }
 
       /* Larger click target; no background fill (Tufte: no chartjunk) */
@@ -66,6 +67,25 @@ st.markdown(
         all tab labels are short (1–3 words) and the strip height is fixed by the
         padding — there is no layout shift from the weight change.
       */
+
+      /* ── Responsive radio buttons — wrap on narrow screens ───────────────── */
+      .stRadio > div { flex-wrap: wrap; gap: 6px; }
+
+      /* ── Tablet breakpoint (≤768px) ──────────────────────────────────────── */
+      @media (max-width: 768px) {
+        [data-testid="metric-container"] { padding: 0.3rem 0.4rem; }
+        .stTabs [data-baseweb="tab"] { padding: 0.4rem 0.5rem; font-size: 0.75rem; }
+        /* Force column blocks to stack vertically */
+        [data-testid="column"] { min-width: 100% !important; flex: 1 1 100% !important; }
+      }
+
+      /* ── Phone breakpoint (≤480px) ───────────────────────────────────────── */
+      @media (max-width: 480px) {
+        [data-testid="metric-container"] { padding: 0.2rem 0.3rem; }
+        .stTabs [data-baseweb="tab"] { padding: 0.3rem 0.4rem; font-size: 0.7rem; letter-spacing: 0; }
+        h1 { font-size: 1.4rem !important; }
+        h2, h3 { font-size: 1.1rem !important; }
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -485,7 +505,11 @@ if agg.empty:
 
 # ── Summary metrics ────────────────────────────────────────────────────────────
 st.subheader("League snapshot")
-c1, c2, c3, c4, c5 = st.columns(5)
+# Split into two rows (2 + 3) so narrow screens don't squash 5 into tiny columns
+_m_row1 = st.columns(2)
+_m_row2 = st.columns(3)
+c1, c2 = _m_row1
+c3, c4, c5 = _m_row2
 avg_epa_lg = agg["epa_per_play"].mean()
 
 c1.metric("Qualifying QBs", len(agg))
@@ -518,10 +542,10 @@ else:
 _LAYOUT = dict(
     plot_bgcolor="rgba(0,0,0,0)",
     paper_bgcolor="rgba(0,0,0,0)",
-    font=dict(family="Inter, Arial, sans-serif", size=14, color="#333333"),
-    hoverlabel=dict(bgcolor="#1a1a2e", bordercolor="#444466", font_size=14,
+    font=dict(family="Inter, Arial, sans-serif", size=12, color="#333333"),
+    hoverlabel=dict(bgcolor="#1a1a2e", bordercolor="#444466", font_size=12,
                     font_color="white"),
-    margin=dict(l=10, r=90, t=70, b=40),
+    margin=dict(l=5, r=10, t=50, b=30),
     # Remove outer frame
     xaxis=dict(showline=True, linecolor="#cccccc", mirror=False,
                showgrid=False, zeroline=False),
@@ -585,8 +609,8 @@ with tab1:
             showscale=True,
             colorbar=dict(
                 title=dict(text="EPA/play", side="right"),
-                thickness=10, len=0.55, tickformat="+.2f",
-                outlinewidth=0,
+                thickness=8, len=0.4, tickformat="+.2f",
+                outlinewidth=0, x=0.99, xanchor="right",
             ),
         ),
         customdata=list(zip(
@@ -617,10 +641,10 @@ with tab1:
         if row["team_logo_espn"]:
             fig_bar.add_layout_image(dict(
                 source=row["team_logo_espn"],
-                x=1.01, y=row["_label"],
+                x=0.98, y=row["_label"],
                 xref="paper", yref="y",
                 sizex=0.04, sizey=0.04,
-                xanchor="left", yanchor="middle",
+                xanchor="right", yanchor="middle",
                 layer="above",
             ))
 
@@ -640,16 +664,16 @@ with tab1:
             showline=True, linecolor="#cccccc", showgrid=False, zeroline=True,
             zerolinecolor="#aaaaaa", zerolinewidth=1,
         ),
-        yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=13)),
+        yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=11)),
         title=dict(
             text=(
                 f"<b>EPA per Dropback — {', '.join(str(s) for s in sorted(seasons_tab1))}</b>"
                 f"<br><sup>Minimum {min_attempts} attempts · "
                 f"Blue = above league average · Red = below</sup>"
             ),
-            font_size=18, x=0,
+            font_size=16, x=0,
         ),
-        height=max(500, len(df_show) * 46),
+        height=max(350, len(df_show) * 38),
         showlegend=False,
     )
     st.plotly_chart(fig_bar, width="stretch")
@@ -713,12 +737,12 @@ with tab2:
                     "epa_per_play": "EPA per Dropback",
                     "success_rate": "Success Rate",
                 },
-                height=660,
+                height=500,
             )
             fig_sc.update_traces(
                 textposition="top center",
                 texttemplate="%{text} · %{customdata[0]}<br><sup>%{customdata[7]}  %{customdata[8]}</sup>",
-                textfont=dict(size=11, color="#111111"),
+                textfont=dict(size=10, color="#111111"),
                 marker=dict(opacity=0.55, line=dict(width=0.5, color="white")),
                 hovertemplate=(
                     "<span style='font-size:16px'><b>%{text} · %{customdata[0]}</b></span><br>"
@@ -741,13 +765,13 @@ with tab2:
                 y=avg_epa_sc, line_dash="dot", line_color=_NEUTRAL, opacity=0.6,
                 annotation_text=f"Avg EPA {avg_epa_sc:+.2f}",
                 annotation_position="bottom right",
-                annotation_font_size=14, annotation_font_color=_NEUTRAL,
+                annotation_font_size=11, annotation_font_color=_NEUTRAL,
             )
             fig_sc.add_vline(
                 x=avg_cpoe_sc, line_dash="dot", line_color=_NEUTRAL, opacity=0.6,
                 annotation_text=f"Avg CPOE {avg_cpoe_sc:+.2f}%",
                 annotation_position="top left",
-                annotation_font_size=14, annotation_font_color=_NEUTRAL,
+                annotation_font_size=11, annotation_font_color=_NEUTRAL,
             )
 
             x_lo, x_hi = df_sc["cpoe"].min(), df_sc["cpoe"].max()
@@ -765,7 +789,7 @@ with tab2:
             ]:
                 fig_sc.add_annotation(
                     x=qx, y=qy, text=label, showarrow=False,
-                    font=dict(size=14, color=_NEUTRAL), opacity=0.5,
+                    font=dict(size=11, color=_NEUTRAL), opacity=0.5,
                     xanchor="center", yanchor="middle",
                 )
 
@@ -774,11 +798,12 @@ with tab2:
                     text=f"<b>Accuracy vs Efficiency — {_sc_seasons_str}</b>"
                          f"<br><sup>CPOE: completion % relative to model expectation · "
                          f"Color = success rate · Size = {size_metric}</sup>",
-                    font_size=18, x=0,
+                    font_size=16, x=0,
                 ),
                 coloraxis_colorbar=dict(
                     title=dict(text="Success Rate", side="right"),
-                    tickformat=".0%", thickness=10, len=0.55, outlinewidth=0,
+                    tickformat=".0%", thickness=8, len=0.4, outlinewidth=0,
+                    x=0.99, xanchor="right",
                 ),
             )
             _clean_fig(
@@ -803,7 +828,7 @@ with tab3:
     all_qbs = sorted(agg["QB"].unique())
     default_qbs = agg.groupby("QB")["epa_per_play"].mean().nlargest(5).index.tolist()
 
-    col_t1, col_t2 = st.columns([2, 1])
+    col_t1, col_t2 = st.columns([1, 1])
     with col_t1:
         selected_qbs = st.multiselect(
             "QBs to compare", all_qbs, default=default_qbs, key="trend_qbs"
@@ -832,7 +857,7 @@ with tab3:
             color_discrete_sequence=px.colors.qualitative.Safe,
             hover_data={"attempts": True, "touchdowns": True, "success_rate": ":.1%"},
             labels={metric_col: metric_label, "season": "Season"},
-            height=500,
+            height=420,
         )
         fig_trend.update_traces(line=dict(width=2), marker=dict(size=7))
         if is_pct:
@@ -861,8 +886,8 @@ with tab3:
                 showgrid=True, gridcolor="rgba(0,0,0,0.06)", zeroline=False,
             ),
             legend=dict(
-                orientation="v", yanchor="top", y=1, xanchor="left", x=1.01,
-                title=dict(text=""), font=dict(size=13),
+                orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
+                title=dict(text=""), font=dict(size=11),
             ),
         )
         st.plotly_chart(fig_trend, width="stretch")
@@ -984,7 +1009,7 @@ with tab3:
                 zeroline=False, showline=False,
             ),
             legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="right", x=1),
-            height=420,
+            height=360,
         )
         st.plotly_chart(fig_week, width="stretch")
 
@@ -1023,7 +1048,8 @@ with tab4:
             showscale=True,
             colorbar=dict(
                 title=dict(text="Success Rate", side="right"),
-                thickness=10, len=0.55, tickformat=".0%", outlinewidth=0,
+                thickness=8, len=0.4, tickformat=".0%", outlinewidth=0,
+                x=0.99, xanchor="right",
             ),
         ),
         customdata=list(zip(
@@ -1053,10 +1079,10 @@ with tab4:
         if row["team_logo_espn"]:
             fig_sr.add_layout_image(dict(
                 source=row["team_logo_espn"],
-                x=1.01, y=row["_label"],
+                x=0.98, y=row["_label"],
                 xref="paper", yref="y",
                 sizex=0.04, sizey=0.04,
-                xanchor="left", yanchor="middle",
+                xanchor="right", yanchor="middle",
                 layer="above",
             ))
 
@@ -1082,8 +1108,8 @@ with tab4:
             tickformat=".0%",
             showline=True, linecolor="#cccccc", showgrid=False, zeroline=False,
         ),
-        yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=13)),
-        height=max(500, len(df_sr_show) * 46),
+        yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=11)),
+        height=max(350, len(df_sr_show) * 38),
         showlegend=False,
     )
     st.plotly_chart(fig_sr, width="stretch")
@@ -1100,7 +1126,7 @@ with tab5:
     agg_tab5 = agg[agg["season"].isin(seasons_tab5)] if seasons_tab5 else agg
     st.markdown("**Aggregated QB stats** — sorted by season then EPA/play")
 
-    cols_display = [
+    _all_cols = [
         "headshot_url", "team_logo_espn",
         "season", "QB", "Team", "attempts", "dropbacks",
         "epa_per_play", "epa_total", "success_rate",
@@ -1109,46 +1135,57 @@ with tab5:
         "dropbacks_per_game", "team_dropback_share", "team_epa_share",
         "snap_adj_epa", "weekly_epa_std", "passing_down_rate",
     ]
+    _core_cols = [
+        "headshot_url", "team_logo_espn",
+        "season", "QB", "Team", "attempts",
+        "epa_per_play", "success_rate", "cpoe", "epa_clean", "pressure_drop",
+    ]
+    _optional_cols = [c for c in _all_cols if c not in _core_cols]
 
-    styled = (
-        agg_tab5[cols_display]
-        .sort_values(["season", "epa_per_play"], ascending=[False, False])
-        .style
-        .format({
-            "attempts":             "{:.0f}",
-            "dropbacks":            "{:.0f}",
-            "touchdowns":           "{:.0f}",
-            "interceptions":        "{:.0f}",
-            "sacks":                "{:.0f}",
-            "epa_per_play":         "{:+.2f}",
-            "epa_total":            "{:+.1f}",
-            "success_rate":         "{:.1%}",
-            "completion_pct":       "{:.1%}",
-            "cpoe":                 "{:+.2f}",
-            "air_yards":            "{:.1f}",
-            "epa_clean":            "{:+.2f}",
-            "epa_pressure":         "{:+.2f}",
-            "pressure_drop":        "{:.2f}",
-            "pressure_rate":        "{:.1%}",
-            "time_to_throw":        "{:.2f}s",
-            "dropbacks_per_game":   "{:.1f}",
-            "team_dropback_share":  "{:.1%}",
-            "team_epa_share":       "{:.1%}",
-            "snap_adj_epa":         "{:+.2f}",
-            "weekly_epa_std":       "{:.2f}",
-            "passing_down_rate":    "{:.1%}",
-        }, na_rep="—")
-        .background_gradient(subset=["epa_per_play"], cmap="RdBu", vmin=-0.3, vmax=0.3)
-        .background_gradient(subset=["success_rate"], cmap="RdBu", vmin=0.35, vmax=0.65)
-        .background_gradient(subset=["pressure_drop"], cmap="RdBu_r", vmin=0.2, vmax=1.2)
-        .set_properties(subset=[
-            "season", "attempts", "dropbacks", "epa_per_play", "epa_total", "success_rate",
-            "cpoe", "completion_pct", "touchdowns", "interceptions", "sacks", "air_yards",
-            "epa_clean", "epa_pressure", "pressure_drop", "pressure_rate", "time_to_throw",
-            "dropbacks_per_game", "team_dropback_share", "team_epa_share",
-            "snap_adj_epa", "weekly_epa_std", "passing_down_rate",
-        ], **{"text-align": "center"})
-    )
+    with st.expander("Select columns to display", expanded=False):
+        extra_cols = st.multiselect(
+            "Additional columns",
+            options=_optional_cols,
+            default=[],
+            key="data_extra_cols",
+        )
+    cols_display = _core_cols + extra_cols
+
+    _all_fmt = {
+        "attempts":             "{:.0f}",
+        "dropbacks":            "{:.0f}",
+        "touchdowns":           "{:.0f}",
+        "interceptions":        "{:.0f}",
+        "sacks":                "{:.0f}",
+        "epa_per_play":         "{:+.2f}",
+        "epa_total":            "{:+.1f}",
+        "success_rate":         "{:.1%}",
+        "completion_pct":       "{:.1%}",
+        "cpoe":                 "{:+.2f}",
+        "air_yards":            "{:.1f}",
+        "epa_clean":            "{:+.2f}",
+        "epa_pressure":         "{:+.2f}",
+        "pressure_drop":        "{:.2f}",
+        "pressure_rate":        "{:.1%}",
+        "time_to_throw":        "{:.2f}s",
+        "dropbacks_per_game":   "{:.1f}",
+        "team_dropback_share":  "{:.1%}",
+        "team_epa_share":       "{:.1%}",
+        "snap_adj_epa":         "{:+.2f}",
+        "weekly_epa_std":       "{:.2f}",
+        "passing_down_rate":    "{:.1%}",
+    }
+    _active_fmt = {k: v for k, v in _all_fmt.items() if k in cols_display}
+    _center_cols = [c for c in cols_display if c not in ("headshot_url", "team_logo_espn", "QB", "Team")]
+    _df_styled = agg_tab5[cols_display].sort_values(["season", "epa_per_play"], ascending=[False, False])
+    _styler = _df_styled.style.format(_active_fmt, na_rep="—")
+    if "epa_per_play" in cols_display:
+        _styler = _styler.background_gradient(subset=["epa_per_play"], cmap="RdBu", vmin=-0.3, vmax=0.3)
+    if "success_rate" in cols_display:
+        _styler = _styler.background_gradient(subset=["success_rate"], cmap="RdBu", vmin=0.35, vmax=0.65)
+    if "pressure_drop" in cols_display:
+        _styler = _styler.background_gradient(subset=["pressure_drop"], cmap="RdBu_r", vmin=0.2, vmax=1.2)
+    styled = _styler.set_properties(subset=_center_cols, **{"text-align": "center"})
 
     st.dataframe(
         styled,
@@ -1159,7 +1196,7 @@ with tab5:
             "team_logo_espn": st.column_config.ImageColumn("Logo",  width="small"),
         },
     )
-    cols_export = [c for c in cols_display if c not in ("headshot_url", "team_logo_espn")]
+    cols_export = [c for c in _all_cols if c not in ("headshot_url", "team_logo_espn")]
     csv = agg_tab5[cols_export].to_csv(index=False)
     
     st.download_button("Download CSV", csv, "qb_epa.csv", "text/csv")
@@ -1189,7 +1226,7 @@ with tab6:
         "**Team EPA share** = QB dropback EPA ÷ team dropback EPA"
     )
 
-    col_u1, col_u2 = st.columns([3, 2])
+    col_u1, col_u2 = st.columns([1, 1])
 
     # ── Scatter: team_dropback_share vs epa_per_play ──────────────────────────
     with col_u1:
@@ -1203,16 +1240,17 @@ with tab6:
             mode="markers+text",
             text=df_usage["QB"].str.split(".").str[-1],  # last name
             textposition="top center",
-            textfont=dict(size=10),
+            textfont=dict(size=9),
             marker=dict(
-                size=df_usage["team_epa_share"].clip(0).mul(60).add(6),
+                size=df_usage["team_epa_share"].clip(0).mul(50).add(5),
                 color=df_usage["snap_adj_epa"],
                 colorscale=_DIVERG,
                 cmid=0,
                 showscale=True,
                 colorbar=dict(
                     title=dict(text="Snap-adj EPA", side="right"),
-                    thickness=10, len=0.55, tickformat="+.3f", outlinewidth=0,
+                    thickness=8, len=0.4, tickformat="+.3f", outlinewidth=0,
+                    x=0.99, xanchor="right",
                 ),
                 line=dict(width=0.5, color="#555555"),
             ),
@@ -1261,7 +1299,7 @@ with tab6:
                 title="EPA per Dropback",
                 showgrid=True, gridcolor="rgba(0,0,0,0.06)", zeroline=False,
             ),
-            height=520,
+            height=440,
             showlegend=False,
         )
         st.plotly_chart(fig_u, width="stretch")
@@ -1311,10 +1349,10 @@ with tab6:
                 title="Snap-adj EPA", tickformat="+.2f",
                 showline=True, linecolor="#cccccc", showgrid=False, zeroline=False,
             ),
-            yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=11)),
-            height=max(400, len(df_snap_bar) * 28),
+            yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=10)),
+            height=max(300, len(df_snap_bar) * 24),
             showlegend=False,
-            margin=dict(l=10, r=20, t=70, b=40),
+            margin=dict(l=5, r=10, t=50, b=30),
         )
         st.plotly_chart(fig_snap, width="stretch")
 

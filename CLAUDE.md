@@ -40,3 +40,4 @@ This is a single-file Streamlit app ([qb_epa_app.py](qb_epa_app.py)) that visual
 **Chart styling:** `_LAYOUT` dict and `_clean_fig()` apply a shared Tufte-minimal theme (no chart junk, transparent background, RdBu diverging palette) to all `go.Figure` objects. Plotly Express figures call `_clean_fig()` after construction.
 
 **Sidebar controls** (`seasons`, `game_type`, `week_range`, `min_attempts`, `wl_type`) apply globally to all tabs via the `agg` DataFrame filter.
+**Deploy** : before merging into main force to do a smoke test.
