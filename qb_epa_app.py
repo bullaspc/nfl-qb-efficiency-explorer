@@ -322,6 +322,18 @@ _team_pass_weight = (
     .rename(columns={"posteam": "Team"})
 )
 
+# ── Team run support: non-QB rushing EPA per play ─────────────────────────────
+_team_run_support = (
+    _raw_plays[
+        (_raw_plays["_is_rush"] == 1) &
+        (_raw_plays["qb_scramble"].fillna(0) != 1)
+    ]
+    .groupby(["season", "posteam"])["epa"]
+    .mean()
+    .reset_index(name="team_rush_epa")
+    .rename(columns={"posteam": "Team"})
+)
+
 # ── Filter to dropback plays ───────────────────────────────────────────────────
 pbp = raw[
     (raw["pass_attempt"] == 1) | (raw["qb_scramble"] == 1)
@@ -489,6 +501,44 @@ agg["games_started"] = (
 
 # ── Enrich with team pass-play weight ─────────────────────────────────────────
 agg = agg.merge(_team_pass_weight, on=["season", "Team"], how="left")
+
+# ── Team run support merge ─────────────────────────────────────────────────────
+agg = agg.merge(_team_run_support, on=["season", "Team"], how="left")
+agg["team_rush_epa"] = agg["team_rush_epa"].round(3)
+
+# ── Clutch factor: Q4 dropbacks with score within one possession ──────────────
+_clutch_mask = (pbp["qtr"] == 4) & (pbp["score_differential"].abs() <= 8)
+_clutch_epa = (
+    pbp[_clutch_mask]
+    .groupby(["season", "passer_player_name", "posteam"])
+    .agg(clutch_epa=("epa", "mean"), clutch_dropbacks=("epa", "count"))
+    .reset_index()
+    .rename(columns={"passer_player_name": "QB", "posteam": "Team"})
+)
+_clutch_epa["clutch_epa"] = _clutch_epa["clutch_epa"].round(3)
+agg = agg.merge(_clutch_epa, on=["season", "QB", "Team"], how="left")
+
+# ── Context Score: weighted percentile index (0–100) ──────────────────────────
+def _pct_rank(series: pd.Series) -> pd.Series:
+    """Percentile rank 0–100 (higher = better) within the current filtered group."""
+    return series.rank(pct=True, method="average").mul(100)
+
+agg["_pct_epa"]      = _pct_rank(agg["epa_per_play"])
+agg["_pct_pressure"] = _pct_rank(agg["epa_pressure"].fillna(agg["epa_per_play"]))
+_clutch_fill = agg["epa_per_play"].where(
+    agg["clutch_dropbacks"].fillna(0) < 10, agg["clutch_epa"]
+)
+agg["_pct_clutch"]  = _pct_rank(_clutch_fill.fillna(agg["epa_per_play"]))
+agg["_pct_burden"]  = _pct_rank(agg["pass_play_weight"].fillna(0.5))
+
+# Weights: 40% efficiency + 25% pressure resilience + 20% clutch + 15% pass burden
+agg["context_score"] = (
+    0.40 * agg["_pct_epa"] +
+    0.25 * agg["_pct_pressure"] +
+    0.20 * agg["_pct_clutch"] +
+    0.15 * agg["_pct_burden"]
+).round(1)
+agg.drop(columns=["_pct_epa", "_pct_pressure", "_pct_clutch", "_pct_burden"], inplace=True)
 
 # ── Historical EPA percentile (vs all QB-seasons 2016+, REG, min 150 att) ─────
 _ref_epa = load_epa_reference()
@@ -1217,7 +1267,7 @@ with tab5:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab 6 – Snap & Usage
+# Tab 6 – QB Context & Pressure
 # ══════════════════════════════════════════════════════════════════════════════
 with tab6:
     _all_seasons6 = sorted(agg["season"].unique(), reverse=True)
@@ -1230,171 +1280,379 @@ with tab6:
 
     df_usage = (
         agg[agg["season"].isin(seasons_tab6)]
-        .dropna(subset=["team_dropback_share", "epa_per_play"])
+        .dropna(subset=["epa_per_play"])
         .reset_index(drop=True)
     )
 
     st.markdown(
-        "**Dropback share** = QB dropbacks ÷ total team dropbacks · "
-        "**Snap-adj EPA** = EPA/dropback × dropback share · "
-        "**Team EPA share** = QB dropback EPA ÷ team dropback EPA"
+        "**Pressure drop** = EPA clean pocket − EPA under pressure (lower = more resilient) · "
+        "**Clutch EPA** = EPA/dropback in Q4 with score within 8 pts · "
+        "**Context Score** = 40% EPA + 25% pressure resilience + 20% clutch + 15% pass burden (percentile-weighted, 0–100)"
     )
 
-    col_u1, col_u2 = st.columns([1, 1])
+    # ── ROW 1: Pressure Analysis ───────────────────────────────────────────────
+    st.markdown("#### Pressure Analysis")
+    col_p1, col_p2 = st.columns([1, 1])
 
-    # ── Scatter: team_dropback_share vs epa_per_play ──────────────────────────
-    with col_u1:
-        fig_u = go.Figure()
-        avg_share = df_usage["team_dropback_share"].mean()
-        avg_epa   = df_usage["epa_per_play"].mean()
+    with col_p1:
+        # Horizontal bar: pressure_drop ranking
+        df_press = (
+            df_usage.dropna(subset=["pressure_drop"])
+            .sort_values("pressure_drop", ascending=True)
+            .reset_index(drop=True)
+        )
+        fig_pdrop = go.Figure(go.Bar(
+            x=df_press["pressure_drop"],
+            y=df_press["QB"].str.split(".").str[-1],
+            orientation="h",
+            marker=dict(
+                color=df_press["pressure_drop"],
+                colorscale=_DIVERG,
+                cmid=0,
+                reversescale=True,
+                showscale=False,
+            ),
+            customdata=list(zip(
+                df_press["QB"],
+                df_press["epa_clean"].map(lambda v: f"{v:+.3f}" if pd.notna(v) else "—"),
+                df_press["epa_pressure"].map(lambda v: f"{v:+.3f}" if pd.notna(v) else "—"),
+                df_press["pressure_drop"].map(lambda v: f"{v:+.3f}" if pd.notna(v) else "—"),
+                df_press["pressure_rate"].map(lambda v: f"{v:.1%}" if pd.notna(v) else "—"),
+            )),
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Clean EPA: %{customdata[1]}<br>"
+                "Pressure EPA: %{customdata[2]}<br>"
+                "Drop: %{customdata[3]}<br>"
+                "Pressure rate: %{customdata[4]}"
+                "<extra></extra>"
+            ),
+            name="",
+        ))
+        fig_pdrop.add_vline(x=0, line_dash="solid", line_color=_NEUTRAL, opacity=0.4)
+        _clean_fig(
+            fig_pdrop,
+            title=dict(
+                text="<b>Pressure Resilience</b>"
+                     "<br><sup>Clean EPA − Pressure EPA · lower bar = less drop-off</sup>",
+                font_size=13, x=0,
+            ),
+            xaxis=dict(
+                title="Pressure Drop (EPA units)", tickformat="+.3f",
+                showline=True, linecolor="#cccccc", showgrid=False, zeroline=False,
+            ),
+            yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=10)),
+            height=max(300, len(df_press) * 24),
+            showlegend=False,
+            margin=dict(l=5, r=10, t=50, b=30),
+        )
+        st.plotly_chart(fig_pdrop, width="stretch")
 
-        fig_u.add_trace(go.Scatter(
-            x=df_usage["team_dropback_share"],
-            y=df_usage["epa_per_play"],
+    with col_p2:
+        # Scatter: pressure_rate (X) vs epa_pressure (Y)
+        df_ps = df_usage.dropna(subset=["pressure_rate", "epa_pressure"]).reset_index(drop=True)
+        avg_prate = df_ps["pressure_rate"].mean()
+        avg_epa_press = df_ps["epa_pressure"].mean()
+
+        fig_ps = go.Figure()
+        fig_ps.add_trace(go.Scatter(
+            x=df_ps["pressure_rate"],
+            y=df_ps["epa_pressure"],
             mode="markers+text",
-            text=df_usage["QB"].str.split(".").str[-1],  # last name
+            text=df_ps["QB"].str.split(".").str[-1],
             textposition="top center",
             textfont=dict(size=9),
             marker=dict(
-                size=df_usage["team_epa_share"].clip(0).mul(50).add(5),
-                color=df_usage["snap_adj_epa"],
+                size=10,
+                color=df_ps["pressure_drop"],
                 colorscale=_DIVERG,
-                cmid=0,
+                cmid=df_ps["pressure_drop"].median(),
+                reversescale=True,
                 showscale=True,
                 colorbar=dict(
-                    title=dict(text="Snap-adj EPA", side="right"),
+                    title=dict(text="Pressure Drop", side="right"),
                     thickness=8, len=0.4, tickformat="+.3f", outlinewidth=0,
                     x=0.99, xanchor="right",
                 ),
                 line=dict(width=0.5, color="#555555"),
             ),
             customdata=list(zip(
-                df_usage["QB"],
-                df_usage["team_dropback_share"].map(lambda v: f"{v:.1%}"),
-                df_usage["epa_per_play"].map(lambda v: f"{v:+.2f}"),
-                df_usage["team_epa_share"].map(lambda v: f"{v:.1%}"),
-                df_usage["snap_adj_epa"].map(lambda v: f"{v:+.2f}"),
-                df_usage["dropbacks_per_game"].map(lambda v: f"{v:.1f}"),
-                df_usage["weekly_epa_std"].map(lambda v: f"{v:.2f}" if pd.notna(v) else "—"),
+                df_ps["QB"],
+                df_ps["pressure_rate"].map(lambda v: f"{v:.1%}"),
+                df_ps["epa_pressure"].map(lambda v: f"{v:+.3f}"),
+                df_ps["pressure_drop"].map(lambda v: f"{v:+.3f}" if pd.notna(v) else "—"),
             )),
             hovertemplate=(
                 "<b>%{customdata[0]}</b><br>"
-                "Dropback share: %{customdata[1]}<br>"
-                "EPA/dropback: %{customdata[2]}<br>"
-                "Team EPA share: %{customdata[3]}<br>"
-                "Snap-adj EPA: %{customdata[4]}<br>"
-                "Dropbacks/game: %{customdata[5]}<br>"
-                "Weekly EPA std: %{customdata[6]}"
+                "Pressure rate: %{customdata[1]}<br>"
+                "EPA under pressure: %{customdata[2]}<br>"
+                "Pressure drop: %{customdata[3]}"
                 "<extra></extra>"
             ),
             name="",
         ))
-
-        # Quadrant lines
-        for x_ref in [avg_share]:
-            fig_u.add_vline(x=x_ref, line_dash="dot", line_color=_NEUTRAL, opacity=0.5)
-        for y_ref in [avg_epa]:
-            fig_u.add_hline(y=y_ref, line_dash="dot", line_color=_NEUTRAL, opacity=0.5)
+        fig_ps.add_vline(x=avg_prate, line_dash="dot", line_color=_NEUTRAL, opacity=0.5,
+                         annotation_text="avg", annotation_position="top right",
+                         annotation_font_size=8, annotation_font_color=_NEUTRAL)
+        fig_ps.add_hline(y=avg_epa_press, line_dash="dot", line_color=_NEUTRAL, opacity=0.5)
 
         _clean_fig(
-            fig_u,
+            fig_ps,
             title=dict(
-                text="<b>Scheme Trust vs Efficiency</b>"
-                     "<br><sup>Bubble size = team EPA share · color = snap-adj EPA</sup>",
-                font_size=14, x=0,
+                text="<b>Pressure Rate vs EPA Under Pressure</b>"
+                     "<br><sup>Top-left = elite · bottom-right = vulnerable · color = pressure drop</sup>",
+                font_size=13, x=0,
             ),
             xaxis=dict(
-                title="Dropback Share of Team Dropbacks",
-                tickformat=".0%",
-                showline=True, linecolor="#cccccc", showgrid=False,
-                zeroline=False,
+                title="Pressure Rate", tickformat=".0%",
+                showline=True, linecolor="#cccccc", showgrid=False, zeroline=False,
             ),
             yaxis=dict(
-                title="EPA per Dropback",
+                title="EPA/dropback Under Pressure",
                 showgrid=True, gridcolor="rgba(0,0,0,0.06)", zeroline=False,
             ),
             height=440,
             showlegend=False,
         )
-        st.plotly_chart(fig_u, width="stretch")
+        st.plotly_chart(fig_ps, width="stretch")
 
-    # ── Bar: snap-adjusted EPA ranking ───────────────────────────────────────
-    with col_u2:
-        df_snap_bar = df_usage.sort_values("snap_adj_epa").reset_index(drop=True)
-        lg_avg_snap = df_snap_bar["snap_adj_epa"].mean()
+    # ── ROW 2: Team Scheme Context + Clutch Factor ─────────────────────────────
+    st.markdown("#### Team Context & Clutch")
+    col_c1, col_c2 = st.columns([1, 1])
 
-        fig_snap = go.Figure(go.Bar(
-            x=df_snap_bar["snap_adj_epa"],
-            y=df_snap_bar["QB"].str.split(".").str[-1],
-            orientation="h",
+    with col_c1:
+        # Scatter: pass_play_weight (X) vs team_rush_epa (Y)
+        df_scheme = df_usage.dropna(subset=["pass_play_weight", "team_rush_epa"]).reset_index(drop=True)
+        avg_ppw = df_scheme["pass_play_weight"].mean()
+        avg_rush = df_scheme["team_rush_epa"].mean()
+
+        fig_scheme = go.Figure()
+        fig_scheme.add_trace(go.Scatter(
+            x=df_scheme["pass_play_weight"],
+            y=df_scheme["team_rush_epa"],
+            mode="markers+text",
+            text=df_scheme["QB"].str.split(".").str[-1],
+            textposition="top center",
+            textfont=dict(size=9),
             marker=dict(
-                color=df_snap_bar["snap_adj_epa"],
+                size=df_scheme["team_dropback_share"].clip(0).mul(40).add(6),
+                color=df_scheme["epa_per_play"],
                 colorscale=_DIVERG,
-                cmid=lg_avg_snap,
-                showscale=False,
+                cmid=df_scheme["epa_per_play"].mean(),
+                showscale=True,
+                colorbar=dict(
+                    title=dict(text="QB EPA/play", side="right"),
+                    thickness=8, len=0.4, tickformat="+.2f", outlinewidth=0,
+                    x=0.99, xanchor="right",
+                ),
+                line=dict(width=0.5, color="#555555"),
             ),
             customdata=list(zip(
-                df_snap_bar["QB"],
-                df_snap_bar["snap_adj_epa"].map(lambda v: f"{v:+.2f}"),
-                df_snap_bar["team_dropback_share"].map(lambda v: f"{v:.1%}"),
+                df_scheme["QB"],
+                df_scheme["Team"],
+                df_scheme["pass_play_weight"].map(lambda v: f"{v:.1%}"),
+                df_scheme["team_rush_epa"].map(lambda v: f"{v:+.3f}" if pd.notna(v) else "—"),
+                df_scheme["epa_per_play"].map(lambda v: f"{v:+.3f}"),
+                df_scheme["team_dropback_share"].map(lambda v: f"{v:.1%}" if pd.notna(v) else "—"),
             )),
             hovertemplate=(
-                "<b>%{customdata[0]}</b><br>"
-                "Snap-adj EPA: %{customdata[1]}<br>"
-                "Dropback share: %{customdata[2]}"
+                "<b>%{customdata[0]}</b> (%{customdata[1]})<br>"
+                "Pass heaviness: %{customdata[2]}<br>"
+                "Team rush EPA: %{customdata[3]}<br>"
+                "QB EPA/play: %{customdata[4]}<br>"
+                "Dropback share: %{customdata[5]}"
                 "<extra></extra>"
             ),
             name="",
         ))
-        fig_snap.add_vline(
-            x=lg_avg_snap, line_dash="dot", line_color=_NEUTRAL, opacity=0.6,
-            annotation_text=f"avg {lg_avg_snap:+.2f}",
-            annotation_position="top right",
-            annotation_font_size=9, annotation_font_color=_NEUTRAL,
-        )
+        fig_scheme.add_vline(x=avg_ppw, line_dash="dot", line_color=_NEUTRAL, opacity=0.5,
+                             annotation_text="avg pass%", annotation_position="top right",
+                             annotation_font_size=8, annotation_font_color=_NEUTRAL)
+        fig_scheme.add_hline(y=avg_rush, line_dash="dot", line_color=_NEUTRAL, opacity=0.5,
+                             annotation_text="avg rush EPA", annotation_position="right",
+                             annotation_font_size=8, annotation_font_color=_NEUTRAL)
+
         _clean_fig(
-            fig_snap,
+            fig_scheme,
             title=dict(
-                text="<b>Snap-Adj EPA Rank</b>"
-                     "<br><sup>EPA/play × dropback share</sup>",
+                text="<b>Team Scheme Context</b>"
+                     "<br><sup>Pass heaviness × run support · bubble = dropback share · color = QB EPA/play</sup>",
                 font_size=13, x=0,
             ),
             xaxis=dict(
-                title="Snap-adj EPA", tickformat="+.2f",
+                title="Team Pass Play %", tickformat=".0%",
                 showline=True, linecolor="#cccccc", showgrid=False, zeroline=False,
             ),
-            yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=10)),
-            height=max(300, len(df_snap_bar) * 24),
+            yaxis=dict(
+                title="Team Rush EPA/play (non-QB)",
+                showgrid=True, gridcolor="rgba(0,0,0,0.06)", zeroline=False,
+            ),
+            height=440,
             showlegend=False,
-            margin=dict(l=5, r=10, t=50, b=30),
         )
-        st.plotly_chart(fig_snap, width="stretch")
+        st.plotly_chart(fig_scheme, width="stretch")
 
-    # ── Usage summary table ───────────────────────────────────────────────────
-    st.markdown("#### Usage detail")
+    with col_c2:
+        # Horizontal bar: clutch_epa ranking
+        df_clutch = (
+            df_usage.dropna(subset=["clutch_epa"])
+            .sort_values("clutch_epa", ascending=True)
+            .reset_index(drop=True)
+        )
+        if df_clutch.empty:
+            st.info("No clutch data available for the selected filters.")
+        else:
+            avg_clutch = df_clutch["clutch_epa"].mean()
+            fig_clutch = go.Figure(go.Bar(
+                x=df_clutch["clutch_epa"],
+                y=df_clutch["QB"].str.split(".").str[-1],
+                orientation="h",
+                marker=dict(
+                    color=df_clutch["clutch_epa"],
+                    colorscale=_DIVERG,
+                    cmid=0,
+                    showscale=False,
+                ),
+                customdata=list(zip(
+                    df_clutch["QB"],
+                    df_clutch["clutch_epa"].map(lambda v: f"{v:+.3f}"),
+                    df_clutch["clutch_dropbacks"].map(lambda v: f"{int(v)}" if pd.notna(v) else "—"),
+                    df_clutch["epa_per_play"].map(lambda v: f"{v:+.3f}"),
+                )),
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>"
+                    "Clutch EPA: %{customdata[1]}<br>"
+                    "Clutch dropbacks: %{customdata[2]}<br>"
+                    "Overall EPA: %{customdata[3]}"
+                    "<extra></extra>"
+                ),
+                name="",
+            ))
+            fig_clutch.add_vline(x=0, line_dash="solid", line_color=_NEUTRAL, opacity=0.4)
+            fig_clutch.add_vline(
+                x=avg_clutch, line_dash="dot", line_color=_NEUTRAL, opacity=0.6,
+                annotation_text=f"avg {avg_clutch:+.2f}",
+                annotation_position="top right",
+                annotation_font_size=9, annotation_font_color=_NEUTRAL,
+            )
+            _clean_fig(
+                fig_clutch,
+                title=dict(
+                    text="<b>Clutch Factor</b>"
+                         "<br><sup>EPA/dropback · Q4 · score within 8 pts (≥10 dropbacks)</sup>",
+                    font_size=13, x=0,
+                ),
+                xaxis=dict(
+                    title="Clutch EPA/dropback", tickformat="+.3f",
+                    showline=True, linecolor="#cccccc", showgrid=False, zeroline=False,
+                ),
+                yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=10)),
+                height=max(300, len(df_clutch) * 24),
+                showlegend=False,
+                margin=dict(l=5, r=10, t=50, b=30),
+            )
+            st.plotly_chart(fig_clutch, width="stretch")
+
+    # ── ROW 3: Context Score ───────────────────────────────────────────────────
+    st.markdown("#### Context Score")
+    df_ctx = (
+        df_usage.dropna(subset=["context_score"])
+        .sort_values("context_score", ascending=True)
+        .reset_index(drop=True)
+    )
+    avg_ctx = df_ctx["context_score"].mean()
+
+    fig_ctx = go.Figure(go.Bar(
+        x=df_ctx["context_score"],
+        y=df_ctx["QB"].str.split(".").str[-1],
+        orientation="h",
+        marker=dict(
+            color=df_ctx["context_score"],
+            colorscale="RdYlGn",
+            cmin=0,
+            cmax=100,
+            showscale=True,
+            colorbar=dict(
+                title=dict(text="Score", side="right"),
+                thickness=8, len=0.3, outlinewidth=0,
+                x=0.99, xanchor="right",
+            ),
+        ),
+        customdata=list(zip(
+            df_ctx["QB"],
+            df_ctx["context_score"].map(lambda v: f"{v:.1f}"),
+            df_ctx["epa_per_play"].map(lambda v: f"{v:+.3f}" if pd.notna(v) else "—"),
+            df_ctx["epa_pressure"].map(lambda v: f"{v:+.3f}" if pd.notna(v) else "—"),
+            df_ctx["clutch_epa"].map(lambda v: f"{v:+.3f}" if pd.notna(v) else "—"),
+            df_ctx["pass_play_weight"].map(lambda v: f"{v:.1%}" if pd.notna(v) else "—"),
+            df_ctx["team_rush_epa"].map(lambda v: f"{v:+.3f}" if pd.notna(v) else "—"),
+        )),
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Context Score: %{customdata[1]}/100<br>"
+            "─────────────────<br>"
+            "EPA/play: %{customdata[2]}<br>"
+            "EPA under pressure: %{customdata[3]}<br>"
+            "Clutch EPA: %{customdata[4]}<br>"
+            "Team pass%: %{customdata[5]}<br>"
+            "Team rush EPA: %{customdata[6]}"
+            "<extra></extra>"
+        ),
+        name="",
+    ))
+    fig_ctx.add_vline(x=50, line_dash="dot", line_color=_NEUTRAL, opacity=0.5,
+                      annotation_text="median (50)", annotation_position="top right",
+                      annotation_font_size=9, annotation_font_color=_NEUTRAL)
+    _clean_fig(
+        fig_ctx,
+        title=dict(
+            text="<b>Context Score</b>"
+                 "<br><sup>40% EPA efficiency · 25% pressure resilience · 20% clutch · 15% pass burden — percentile-ranked 0–100</sup>",
+            font_size=13, x=0,
+        ),
+        xaxis=dict(
+            title="Context Score (0–100)", range=[0, 100],
+            showline=True, linecolor="#cccccc", showgrid=False, zeroline=False,
+        ),
+        yaxis=dict(title="", showline=False, showgrid=False, zeroline=False, tickfont=dict(size=10)),
+        height=max(300, len(df_ctx) * 24),
+        showlegend=False,
+        margin=dict(l=5, r=10, t=60, b=30),
+    )
+    st.plotly_chart(fig_ctx, width="stretch")
+
+    # ── Data Table ────────────────────────────────────────────────────────────
+    st.markdown("#### Detail")
     usage_cols = [
-        "season", "QB", "Team", "dropbacks", "dropbacks_per_game",
-        "team_dropback_share", "team_epa_share", "snap_adj_epa",
-        "weekly_epa_std", "passing_down_rate",
+        "season", "QB", "Team",
+        "epa_per_play", "pressure_rate", "epa_clean", "epa_pressure", "pressure_drop",
+        "pass_play_weight", "team_rush_epa",
+        "clutch_epa", "clutch_dropbacks",
+        "context_score",
+        "team_dropback_share", "snap_adj_epa",
     ]
+    # keep only columns that exist (safe guard)
+    usage_cols = [c for c in usage_cols if c in df_usage.columns]
     df_usage_tbl = (
         df_usage[usage_cols]
-        .sort_values("snap_adj_epa", ascending=False)
+        .sort_values("context_score", ascending=False)
         .style
         .format({
-            "dropbacks":           "{:.0f}",
-            "dropbacks_per_game":  "{:.1f}",
+            "epa_per_play":        "{:+.3f}",
+            "pressure_rate":       "{:.1%}",
+            "epa_clean":           "{:+.3f}",
+            "epa_pressure":        "{:+.3f}",
+            "pressure_drop":       "{:+.3f}",
+            "pass_play_weight":    "{:.1%}",
+            "team_rush_epa":       "{:+.3f}",
+            "clutch_epa":          "{:+.3f}",
+            "clutch_dropbacks":    "{:.0f}",
+            "context_score":       "{:.1f}",
             "team_dropback_share": "{:.1%}",
-            "team_epa_share":      "{:.1%}",
             "snap_adj_epa":        "{:+.2f}",
-            "weekly_epa_std":      "{:.2f}",
-            "passing_down_rate":   "{:.1%}",
         }, na_rep="—")
-        .background_gradient(subset=["snap_adj_epa"], cmap="RdBu", vmin=-0.08, vmax=0.08)
-        .background_gradient(subset=["team_dropback_share"], cmap="Blues", vmin=0.3, vmax=1.0)
-        .set_properties(subset=[
-            "dropbacks", "dropbacks_per_game", "team_dropback_share",
-            "team_epa_share", "snap_adj_epa", "weekly_epa_std", "passing_down_rate",
-        ], **{"text-align": "center"})
+        .background_gradient(subset=["context_score"], cmap="RdYlGn", vmin=0, vmax=100)
+        .background_gradient(subset=["pressure_drop"], cmap="RdBu_r", vmin=-0.3, vmax=0.3)
+        .background_gradient(subset=["clutch_epa"],    cmap="RdBu",   vmin=-0.3, vmax=0.3)
     )
     st.dataframe(df_usage_tbl, hide_index=True, width="stretch")
