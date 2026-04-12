@@ -7,3 +7,5 @@ venv/
 .DS_Store
 .claude/
 data/
+.pytest_cache/
+tests/.test_baseline.json
