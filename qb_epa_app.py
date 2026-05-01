@@ -268,9 +268,14 @@ def load_qb_records(seasons: list[int]) -> pd.DataFrame:
         .reset_index()
     )
     wl["games_started"] = wl["w"] + wl["l"] + wl["t"]
-    wl["record"] = wl.apply(
-        lambda r: f"{int(r.w)}-{int(r.l)}-{int(r.t)}" if r.t > 0 else f"{int(r.w)}-{int(r.l)}",
-        axis=1,
+    wl["record"] = (
+        wl["w"].astype(int).astype(str) + "-" + wl["l"].astype(int).astype(str)
+    )
+    ties = wl["t"] > 0
+    wl.loc[ties, "record"] = (
+        wl.loc[ties, "w"].astype(int).astype(str) + "-"
+        + wl.loc[ties, "l"].astype(int).astype(str) + "-"
+        + wl.loc[ties, "t"].astype(int).astype(str)
     )
     wl.rename(columns={"passer_player_name": "QB"}, inplace=True)
     return wl[["season", "QB", "season_type", "record", "games_started"]]
